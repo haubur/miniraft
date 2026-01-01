@@ -1,0 +1,8 @@
+[package]
+name = "kv"
+description = "Types and implementations for a key-value store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true

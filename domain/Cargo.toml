@@ -1,0 +1,8 @@
+[package]
+name = "domain"
+description = "Domain-specific types and associated implementations for the Raft consensus protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true

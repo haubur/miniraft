@@ -1,0 +1,7 @@
+[package]
+name = "async-runtime"
+description = "Implementation for an async runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
