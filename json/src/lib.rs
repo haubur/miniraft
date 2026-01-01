@@ -3,6 +3,7 @@ use std::{
     fmt::Display,
     io::{self, BufReader, Bytes, Read},
     iter::Peekable,
+    num::{ParseFloatError, ParseIntError},
     str,
 };
 
@@ -18,14 +19,99 @@ const ARRAY_OPEN: u8 = b'[';
 const ARRAY_SEP: u8 = b',';
 const ARRAY_CLOSE: u8 = b']';
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Value {
     String(String),
-    Number(f64),
+    Number(Number),
     Object(HashMap<String, Value>),
     Array(Vec<Value>),
     Bool(bool),
     Null,
+}
+
+/// A JSON number.
+///
+/// In the JSON spec, numbers have infinite precision. While often limited to [`f64`] in
+/// real-world implementations, this type helps retain original, unlimited JSON
+/// precision. Parsing simply normalizes the contained [`String`] to correspond to JSON
+/// rules, such that all valid instances are valid JSON. Converting to native numeric
+/// types is then up to consumers. Some common conversions are provided.
+#[derive(Debug)]
+pub struct Number(String);
+
+/// Compare numbers in ascending order of precision, by actual numeric value.
+impl PartialEq for Number {
+    fn eq(&self, other: &Self) -> bool {
+        let left: Result<u64, _> = self.try_into();
+        let right: Result<u64, _> = other.try_into();
+        if let (Ok(l), Ok(r)) = (left, right) {
+            return l == r;
+        }
+
+        let left: Result<i64, _> = self.try_into();
+        let right: Result<i64, _> = other.try_into();
+        if let (Ok(l), Ok(r)) = (left, right) {
+            return l == r;
+        }
+
+        // Precision loss can occur here.
+        let left: Result<f64, _> = self.try_into();
+        let right: Result<f64, _> = other.try_into();
+        if let (Ok(l), Ok(r)) = (left, right) {
+            return l == r;
+        }
+
+        // Fallback to direct string comparison.
+        self.0 == other.0
+    }
+}
+
+impl TryFrom<Number> for u64 {
+    type Error = ParseIntError;
+
+    fn try_from(value: Number) -> Result<Self, Self::Error> {
+        value.0.parse()
+    }
+}
+
+impl TryFrom<&Number> for u64 {
+    type Error = ParseIntError;
+
+    fn try_from(value: &Number) -> Result<Self, Self::Error> {
+        value.0.parse()
+    }
+}
+
+impl TryFrom<Number> for i64 {
+    type Error = ParseIntError;
+
+    fn try_from(value: Number) -> Result<Self, Self::Error> {
+        value.0.parse()
+    }
+}
+
+impl TryFrom<&Number> for i64 {
+    type Error = ParseIntError;
+
+    fn try_from(value: &Number) -> Result<Self, Self::Error> {
+        value.0.parse()
+    }
+}
+
+impl TryFrom<Number> for f64 {
+    type Error = ParseFloatError;
+
+    fn try_from(value: Number) -> Result<Self, Self::Error> {
+        value.0.parse()
+    }
+}
+
+impl TryFrom<&Number> for f64 {
+    type Error = ParseFloatError;
+
+    fn try_from(value: &Number) -> Result<Self, Self::Error> {
+        value.0.parse()
+    }
 }
 
 #[derive(Debug)]
@@ -113,7 +199,7 @@ impl<R: Read> Parser<R> {
     /// Get the next byte from the underlying reader. Calling this method signals a
     /// *need* for a next byte, thus if none is found (reader finished or errored), it
     /// is considered an error.
-    fn next(&mut self) -> Result<u8, ParseError> {
+    fn advance(&mut self) -> Result<u8, ParseError> {
         let byte = self.stream.next().ok_or(ParseError::UnexpectedEOF)??;
         self.stream_pos += 1;
         Ok(byte)
@@ -127,7 +213,14 @@ impl<R: Read> Parser<R> {
             Some(Ok(ARRAY_OPEN)) => self.visit_array().map(Value::Array)?,
             Some(Ok(b't')) | Some(Ok(b'f')) => self.visit_bool().map(Value::Bool)?,
             Some(Ok(b'n')) => self.visit_null().map(|_| Value::Null)?,
-            _ => todo!("more value types"),
+            Some(Ok(b'-')) | Some(Ok(b'0'..=b'9')) => self.visit_number().map(Value::Number)?,
+            Some(Ok(byte)) => {
+                return Err(ParseError::InvalidByte {
+                    byte: *byte,
+                    reason: "invalid byte looking for beginning of value".into(),
+                });
+            }
+            _ => return Err(ParseError::UnexpectedEOF),
         };
         self.skip_whitespace()?;
 
@@ -142,7 +235,7 @@ impl<R: Read> Parser<R> {
                 // Actually consume it. I don't think this can genuinely error after
                 // having just successfully peeked, but it'd be a shame to unnecessarily
                 // panic; so just have this return a Result.
-                self.next()?;
+                self.advance()?;
             } else {
                 break;
             }
@@ -153,7 +246,7 @@ impl<R: Read> Parser<R> {
 
     fn visit_object(&mut self) -> Result<HashMap<String, Value>, ParseError> {
         {
-            let byte = self.next()?;
+            let byte = self.advance()?;
             if byte != OBJECT_OPEN {
                 return Err(ParseError::InvalidByte {
                     byte,
@@ -168,14 +261,14 @@ impl<R: Read> Parser<R> {
 
         // Early return for empty object
         if let Some(Ok(OBJECT_CLOSE)) = self.stream.peek() {
-            let _ = self.next()?;
+            let _ = self.advance()?;
             return Ok(map);
         }
 
         loop {
             let key = self.visit_string()?;
             self.skip_whitespace()?;
-            match self.next()? {
+            match self.advance()? {
                 OBJECT_KV_SEP => { /* OK */ }
                 byte => {
                     break Err(ParseError::InvalidByte {
@@ -188,7 +281,7 @@ impl<R: Read> Parser<R> {
 
             map.insert(key, value);
 
-            match self.next()? {
+            match self.advance()? {
                 OBJECT_CLOSE => break Ok(map),
                 OBJECT_ENTRIES_SEP => {
                     self.skip_whitespace()?;
@@ -209,7 +302,7 @@ impl<R: Read> Parser<R> {
 
     fn visit_string(&mut self) -> Result<String, ParseError> {
         {
-            let byte = self.next()?;
+            let byte = self.advance()?;
             if byte != STRING_QUOTE {
                 return Err(ParseError::InvalidByte {
                     byte,
@@ -241,12 +334,12 @@ impl<R: Read> Parser<R> {
         };
 
         loop {
-            match self.next()? {
+            match self.advance()? {
                 STRING_QUOTE => {
                     flush_escapes(&mut codepoint_escapes, &mut s)?;
                     break Ok(s);
                 }
-                STRING_ESCAPE_OPEN => match self.next()? {
+                STRING_ESCAPE_OPEN => match self.advance()? {
                     b'"' => {
                         flush_escapes(&mut codepoint_escapes, &mut s)?;
                         s.push('"');
@@ -305,16 +398,16 @@ impl<R: Read> Parser<R> {
                     // byte actually looks OK. The `str` will be stack-allocated, which
                     // is a neat bonus.
                     if 0b0010_0000u8 & byte == 0 {
-                        bytes[1] = self.next()?;
+                        bytes[1] = self.advance()?;
                         s.push_str(str::from_utf8(&bytes[..2])?);
                     } else if 0b0001_0000u8 & byte == 0 {
-                        bytes[1] = self.next()?;
-                        bytes[2] = self.next()?;
+                        bytes[1] = self.advance()?;
+                        bytes[2] = self.advance()?;
                         s.push_str(str::from_utf8(&bytes[..3])?);
                     } else if 0b0000_1000u8 & byte == 0 {
-                        bytes[1] = self.next()?;
-                        bytes[2] = self.next()?;
-                        bytes[3] = self.next()?;
+                        bytes[1] = self.advance()?;
+                        bytes[2] = self.advance()?;
+                        bytes[3] = self.advance()?;
                         s.push_str(str::from_utf8(&bytes[..4])?);
                     } else {
                         break Err(ParseError::UnicodeError(UnicodeError::InvalidUTF8Start(
@@ -328,7 +421,7 @@ impl<R: Read> Parser<R> {
 
     fn visit_array(&mut self) -> Result<Vec<Value>, ParseError> {
         {
-            let byte = self.next()?;
+            let byte = self.advance()?;
             if byte != ARRAY_OPEN {
                 return Err(ParseError::InvalidByte {
                     byte,
@@ -343,13 +436,13 @@ impl<R: Read> Parser<R> {
 
         // Early return for empty array
         if let Some(Ok(ARRAY_CLOSE)) = self.stream.peek() {
-            let _ = self.next()?;
+            let _ = self.advance()?;
             return Ok(array);
         }
 
         loop {
             array.push(self.visit_value()?);
-            match self.next()? {
+            match self.advance()? {
                 ARRAY_CLOSE => break Ok(array),
                 ARRAY_SEP => continue,
                 byte => {
@@ -366,7 +459,7 @@ impl<R: Read> Parser<R> {
     }
 
     fn visit_bool(&mut self) -> Result<bool, ParseError> {
-        let (expected_remainder, result) = match self.next()? {
+        let (expected_remainder, result) = match self.advance()? {
             b't' => (b"rue".as_slice(), true),
             b'f' => (b"alse".as_slice(), false),
             byte => {
@@ -378,7 +471,7 @@ impl<R: Read> Parser<R> {
         };
 
         for expected in expected_remainder.iter().copied() {
-            let got = self.next()?;
+            let got = self.advance()?;
             if expected != got {
                 return Err(ParseError::InvalidByte {
                     byte: got,
@@ -395,7 +488,7 @@ impl<R: Read> Parser<R> {
 
     fn visit_null(&mut self) -> Result<(), ParseError> {
         for expected in b"null".iter().copied() {
-            let got = self.next()?;
+            let got = self.advance()?;
             if expected != got {
                 return Err(ParseError::InvalidByte {
                     byte: got,
@@ -410,6 +503,159 @@ impl<R: Read> Parser<R> {
         Ok(())
     }
 
+    fn visit_number(&mut self) -> Result<Number, ParseError> {
+        let mut number = Number(String::with_capacity(1));
+        number = self.visit_number_integral_part(number)?;
+        number = self.visit_number_fractional_part(number)?;
+        number = self.visit_number_exponent_part(number)?;
+
+        match self.stream.peek() {
+            // If there's a digit left we might have gotten a leading zero followed by
+            // more digits, e.g. `01`. Without fractional or exponent parts, our parsing
+            // just exits after `0`, so check.
+            Some(Ok(byte @ b'0'..=b'9')) => Err(ParseError::InvalidByte {
+                byte: *byte,
+                reason: format!(
+                    "unexpected digit remaining after processing number ('{number:?}')"
+                ),
+            }),
+            _ => Ok(number),
+        }
+    }
+
+    /// Parses the integral part ("bit before period") of a potentially fractional
+    /// number. Parsing stops if no valid tokens can be consumed anymore.
+    ///
+    /// While objects, strings, arrays have delimiters which allow greedy fetching,
+    /// numbers do not. We need to be careful not to overfetch, thus work with peeking
+    /// and more manual advancing. In general, for every `push` into the number, there
+    /// needs to be an advance of the reader.
+    fn visit_number_integral_part(&mut self, mut number: Number) -> Result<Number, ParseError> {
+        // First token is mandatory, there's no way we can overfetch here: so consume
+        // right away.
+        match self.advance()? {
+            b'-' => {
+                number.0.push('-');
+
+                // Finding a digit is mandatory now: can't negate a non-number.
+                match self.advance()? {
+                    b'0' => {
+                        number.0.push('0');
+
+                        // Negative zero: terminal case.
+                        Ok(number)
+                    }
+                    byte @ b'1'..=b'9' => {
+                        number.0.push(byte as char);
+
+                        loop {
+                            // Further digits are optional, so do not overfetch.
+                            match self.stream.peek() {
+                                Some(Ok(byte @ b'0'..=b'9')) => {
+                                    number.0.push(*byte as char);
+                                }
+                                _ => return Ok(number),
+                            }
+                            self.advance()?;
+                        }
+                    }
+                    byte => Err(ParseError::InvalidByte {
+                        byte,
+                        reason: "expected digit after - sign scanning number".into(),
+                    }),
+                }
+            }
+            b'0' => {
+                number.0.push('0');
+                Ok(number)
+            }
+            byte @ b'1'..=b'9' => {
+                number.0.push(byte as char);
+
+                // NB: duplicates logic from above.
+                loop {
+                    match self.stream.peek() {
+                        Some(Ok(byte @ b'0'..=b'9')) => {
+                            number.0.push(*byte as char);
+                        }
+                        _ => return Ok(number),
+                    }
+                    self.advance()?;
+                }
+            }
+            byte => Err(ParseError::InvalidByte {
+                byte,
+                reason: "expected digit or - scanning number".into(),
+            }),
+        }
+    }
+
+    fn visit_number_fractional_part(&mut self, mut number: Number) -> Result<Number, ParseError> {
+        match self.stream.peek() {
+            Some(Ok(b'.')) => {
+                number.0.push('.');
+                self.advance()?;
+            }
+            _ => return Ok(number),
+        }
+
+        loop {
+            match self.stream.peek() {
+                Some(Ok(byte @ b'0'..=b'9')) => {
+                    number.0.push(*byte as char);
+                }
+                _ => return Ok(number),
+            }
+            self.advance()?;
+        }
+    }
+
+    fn visit_number_exponent_part(&mut self, mut number: Number) -> Result<Number, ParseError> {
+        match self.stream.peek() {
+            Some(Ok(b'e' | b'E')) => {
+                number.0.push('e'); // Case doesn't matter
+                self.advance()?;
+            }
+            _ => return Ok(number),
+        }
+
+        // Next token is mandatory, no peeking necessary.
+        match self.advance()? {
+            byte @ (b'+' | b'-') => {
+                number.0.push(byte as char);
+
+                // Also mandatory.
+                match self.advance()? {
+                    byte @ b'0'..=b'9' => number.0.push(byte as char),
+                    byte => {
+                        return Err(ParseError::InvalidByte {
+                            byte,
+                            reason: "expected digit after sign scanning number exponent".into(),
+                        });
+                    }
+                }
+            }
+            byte @ b'0'..=b'9' => number.0.push(byte as char),
+            byte => {
+                return Err(ParseError::InvalidByte {
+                    byte,
+                    reason: "expected digit or sign scanning number exponent".into(),
+                });
+            }
+        }
+
+        // Any further digits are optional.
+        loop {
+            match self.stream.peek() {
+                Some(Ok(byte @ b'0'..=b'9')) => {
+                    number.0.push(*byte as char);
+                }
+                _ => return Ok(number),
+            }
+            self.advance()?;
+        }
+    }
+
     /// Collect exactly 4 hex digits from a JSON escape sequence (which is required to
     /// be exactly 4 long).
     fn collect_hex(&mut self) -> Result<u16, ParseError> {
@@ -418,7 +664,7 @@ impl<R: Read> Parser<R> {
         for _ in 0..4 {
             // Casting works because all hex digits are ASCII, where UTF8 encoding
             // corresponds to Unicode code points directly.
-            let c = self.next()? as char;
+            let c = self.advance()? as char;
 
             // If it wasn't a hex but something malformed, it's caught here.
             let digit = c.to_digit(16).ok_or(ParseError::InvalidHexCharacter(c))?;
@@ -430,6 +676,7 @@ impl<R: Read> Parser<R> {
     }
 }
 
+/// Note JSON whitespace differs from Unicode whitespace, it's a narrower definition.
 fn is_json_whitespace(c: u8) -> bool {
     c == b' ' || c == b'\n' || c == b'\r' || c == b'\t'
 }
@@ -928,9 +1175,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "more value types")]
     fn test_err_array_trailing_comma() {
-        let _ = parse_err(r#"[ "a", ]"#);
+        let err = parse_err(r#"[ "a", ]"#);
+        match err {
+            ParseError::InvalidByte { byte: b']', reason } => {
+                assert!(reason.contains("looking for beginning of value"));
+            }
+            _ => panic!("Wrong error type: {:?}", err),
+        }
     }
 
     // ==========================================
@@ -1057,9 +1309,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "more value types")]
     fn test_err_bool_case_sensitive() {
-        let _ = parse_err("True");
+        let err = parse_err("True");
+        match err {
+            ParseError::InvalidByte { byte: b'T', reason } => {
+                assert!(reason.contains("looking for beginning of value"));
+            }
+            _ => panic!("Wrong error type: {:?}", err),
+        }
     }
 
     // ==========================================
@@ -1177,8 +1434,357 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "more value types")]
     fn test_err_null_case_sensitive() {
-        let _ = parse_err("Null");
+        let err = parse_err("Null");
+        match err {
+            ParseError::InvalidByte { byte: b'N', reason } => {
+                assert!(reason.contains("looking for beginning of value"));
+            }
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    // ==========================================
+    // Number Helpers
+    // ==========================================
+
+    /// Helper to extract a Number variant.
+    fn parse_number(input: &str) -> Number {
+        let mut parser = Parser::new(input.as_bytes());
+        match parser.parse().expect("Failed to parse number") {
+            Value::Number(n) => n,
+            val => panic!("Expected Value::Number, got {:?}", val),
+        }
+    }
+
+    // ==========================================
+    // Number Tests
+    // ==========================================
+
+    #[test]
+    fn test_number_integer() {
+        let n = parse_number("42");
+        let i: i64 = n.try_into().unwrap();
+        assert_eq!(i, 42);
+    }
+
+    #[test]
+    fn test_number_negative_integer() {
+        let n = parse_number("-123");
+        let i: i64 = n.try_into().unwrap();
+        assert_eq!(i, -123);
+    }
+
+    #[test]
+    fn test_number_zero() {
+        let n = parse_number("0");
+        let i: i64 = n.try_into().unwrap();
+        assert_eq!(i, 0);
+    }
+
+    #[test]
+    fn test_number_negative_zero() {
+        let n = parse_number("-0");
+        let f: f64 = n.try_into().unwrap();
+        assert_eq!(f, 0.0);
+        assert!(f.is_sign_negative()); // Rust floats preserve sign of zero
+    }
+
+    #[test]
+    fn test_number_simple_float() {
+        let n = parse_number("12.345");
+        let f: f64 = n.try_into().unwrap();
+        assert_eq!(f, 12.345);
+    }
+
+    #[test]
+    fn test_number_negative_float() {
+        let n = parse_number("-987.654");
+        let f: f64 = n.try_into().unwrap();
+        assert_eq!(f, -987.654);
+    }
+
+    #[test]
+    fn test_number_scientific_lowercase_e() {
+        let n = parse_number("12e3");
+        let f: f64 = n.try_into().unwrap();
+        assert_eq!(f, 12000.0);
+    }
+
+    #[test]
+    fn test_number_scientific_uppercase_e() {
+        let n = parse_number("12E3");
+        let f: f64 = n.try_into().unwrap();
+        assert_eq!(f, 12000.0);
+    }
+
+    #[test]
+    fn test_number_scientific_positive() {
+        let n = parse_number("1.5e+2");
+        let f: f64 = n.try_into().unwrap();
+        assert_eq!(f, 150.0);
+    }
+
+    #[test]
+    fn test_number_scientific_negative() {
+        let n = parse_number("1234e-2");
+        let f: f64 = n.try_into().unwrap();
+        assert!((f - 12.34).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_number_combination() {
+        // Combination of negative, zeroes, decimal, and negative exponent
+        let n = parse_number("-1203.4506e-3");
+        let f: f64 = n.try_into().unwrap();
+        assert!((f - -1.2034506).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_number_u64_conversion() {
+        let n = parse_number("9000");
+        let u: u64 = n.try_into().unwrap();
+        assert_eq!(u, 9000);
+    }
+
+    #[test]
+    fn test_number_conversion_errors() {
+        let n = parse_number("-5");
+        let res: Result<u64, _> = n.try_into();
+        assert!(res.is_err());
+
+        let n2 = parse_number("12.34");
+        let res2: Result<i64, _> = n2.try_into();
+        assert!(res2.is_err());
+    }
+
+    #[test]
+    fn test_array_of_numbers() {
+        let arr = parse_array("[ 0, -100, 3.41, 1e5 ]");
+        assert_eq!(arr.len(), 4);
+
+        if let Value::Number(ref n) = arr[2] {
+            let f: f64 = n.try_into().unwrap();
+            assert_eq!(f, 3.41);
+        } else {
+            panic!("Expected number at index 2");
+        }
+    }
+
+    #[test]
+    fn test_object_with_numbers() {
+        let map = parse_object(r#"{ "id": 123, "score": 99.9 }"#);
+
+        match map.get("id") {
+            Some(Value::Number(n)) => {
+                let i: i64 = n.try_into().unwrap();
+                assert_eq!(i, 123);
+            }
+            _ => panic!("Expected number for id"),
+        }
+    }
+
+    // ==========================================
+    // Number Error Handling Tests
+    // ==========================================
+
+    #[test]
+    fn test_err_number_leading_zero() {
+        let err = parse_err("01");
+        match err {
+            ParseError::InvalidByte { byte: b'1', .. } => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_number_incomplete_exponent() {
+        // "1e" is invalid. Must have digits.
+        let err = parse_err("1e");
+        match err {
+            ParseError::UnexpectedEOF => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_number_exponent_sign_no_digits() {
+        let err = parse_err("1e+");
+        match err {
+            ParseError::UnexpectedEOF => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_number_double_negative() {
+        let err = parse_err("--1");
+        match err {
+            ParseError::InvalidByte { byte: b'-', reason } => {
+                assert!(reason.contains("expected digit"));
+            }
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    // ==========================================
+    // Number equality
+    // ==========================================
+
+    // Helper to make the tests cleaner
+    fn num(input: &str) -> Number {
+        Number(input.to_string())
+    }
+
+    #[test]
+    fn test_basic_equality() {
+        assert_eq!(num("10"), num("10"));
+        assert_eq!(num("0"), num("0"));
+        assert_ne!(num("10"), num("11"));
+    }
+
+    #[test]
+    fn test_cross_type_equality() {
+        // Integers and floats are equal
+        assert_eq!(num("1"), num("1.0"));
+        assert_eq!(num("1"), num("1.00000"));
+        assert_eq!(num("0"), num("0.0"));
+        assert_eq!(num("-0"), num("0"));
+        assert_eq!(num("-0.0"), num("0"));
+    }
+
+    #[test]
+    fn test_signed_integers() {
+        // These will fail the unsigned check and fall through to signed
+        assert_eq!(num("-5"), num("-5"));
+        assert_eq!(num("-5"), num("-5.0")); // Falls through to float
+        assert_ne!(num("-5"), num("5"));
+    }
+
+    #[test]
+    fn test_scientific_notation() {
+        // These fall through to float
+        assert_eq!(num("100"), num("1e2"));
+        assert_eq!(num("100"), num("1.0e2"));
+        assert_eq!(num("0.01"), num("1e-2"));
+
+        // Complex casing (JSON allows e or E)
+        assert_eq!(num("500"), num("5E2"));
+    }
+
+    #[test]
+    fn test_precision_boundaries() {
+        // 1. Fits in u64 - Exact comparison
+        assert_eq!(u64::MAX, 18446744073709551615);
+        let max_u64 = u64::MAX.to_string();
+        let max_u64_minus_1 = (u64::MAX - 1).to_string();
+        assert_eq!(num(&max_u64), num(&max_u64));
+        assert_ne!(num(&max_u64), num(&max_u64_minus_1));
+
+        // 2. Fits in i64, negative - Exact comparison
+        assert_eq!(i64::MIN, -9223372036854775808);
+        let min_i64 = i64::MIN.to_string();
+        assert_eq!(num(&min_i64), num(&min_i64));
+    }
+
+    #[test]
+    fn test_large_number_precision_loss() {
+        // This test documents the behavior of the implementation falling back to f64.
+        // These numbers are much larger than u64::MAX. In f64 representation, they
+        // don't have enough precision to distinguish a difference of 1 at this scale.
+
+        let huge_a = "1000000000000000000000000000001";
+        let huge_b = "1000000000000000000000000000002";
+
+        // They are strictly NOT equal strings, but the equality implementation will say
+        // they are because of f64 fallback.
+        assert_eq!(num(huge_a), num(huge_b));
+    }
+
+    #[test]
+    fn test_number_special_ieee_strings_comparison() {
+        // Parsed as floats but never equal as per spec. This can't actually occur in
+        // JSON.
+        assert_ne!(num("NaN"), num("NaN"));
+
+        // Also can't occur in JSON.
+        assert_eq!(num("inf"), num("inf"));
+
+        // "Proof" that above is parsed as floats; arbitrary strings fall through and
+        // are unequal.
+        assert_ne!(num("NaN"), num("null"));
+        assert_ne!(num("abc"), num("def"));
+    }
+
+    // ==========================================
+    // "Integration" tests
+    // ==========================================
+
+    #[test]
+    fn test_complex_integration() {
+        // A complex JSON object exercising all parsers.
+        let json_input = r#"
+        {
+            "id": 12345,
+            "title": "Complex \u2764 Data",
+            "is_active": true,
+            "deleted": false,
+            "meta": {
+                "created_at": "2023-10-27T10:00:00Z",
+                "counts": [ 1, 2, 3 ],
+                "empty_map": {}
+            },
+            "values": [
+                null,
+                -0.5,
+                1.23e+4,
+                "escaped\nline"
+            ],
+            "empty_list": []
+        }
+        "#;
+
+        // Manually build the expected tree
+        let mut meta_map = HashMap::new();
+        meta_map.insert(
+            "created_at".to_string(),
+            Value::String("2023-10-27T10:00:00Z".to_string()),
+        );
+        meta_map.insert(
+            "counts".to_string(),
+            Value::Array(vec![
+                Value::Number(Number("1".to_string())),
+                Value::Number(Number("2".to_string())),
+                Value::Number(Number("3".to_string())),
+            ]),
+        );
+        meta_map.insert("empty_map".to_string(), Value::Object(HashMap::new()));
+
+        let values_list = vec![
+            Value::Null,
+            Value::Number(Number("-0.5".to_string())),
+            Value::Number(Number("1.23e+4".to_string())), // Matches input string exactly
+            Value::String("escaped\nline".to_string()),
+        ];
+
+        let mut root_map = HashMap::new();
+        root_map.insert("id".to_string(), Value::Number(Number("12345".to_string())));
+        root_map.insert(
+            "title".to_string(),
+            Value::String("Complex ❤ Data".to_string()), // \u2764 parsed to char
+        );
+        root_map.insert("is_active".to_string(), Value::Bool(true));
+        root_map.insert("deleted".to_string(), Value::Bool(false));
+        root_map.insert("meta".to_string(), Value::Object(meta_map));
+        root_map.insert("values".to_string(), Value::Array(values_list));
+        root_map.insert("empty_list".to_string(), Value::Array(vec![]));
+
+        let expected = Value::Object(root_map);
+
+        let mut parser = Parser::new(json_input.as_bytes());
+        let result = parser.parse().expect("Should parse complex JSON");
+
+        // Uses (partial) equality impl
+        assert_eq!(result, expected);
     }
 }
