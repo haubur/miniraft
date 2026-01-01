@@ -126,6 +126,7 @@ impl<R: Read> Parser<R> {
             Some(Ok(OBJECT_OPEN)) => self.visit_object().map(Value::Object)?,
             Some(Ok(ARRAY_OPEN)) => self.visit_array().map(Value::Array)?,
             Some(Ok(b't')) | Some(Ok(b'f')) => self.visit_bool().map(Value::Bool)?,
+            Some(Ok(b'n')) => self.visit_null().map(|_| Value::Null)?,
             _ => todo!("more value types"),
         };
         self.skip_whitespace()?;
@@ -390,6 +391,23 @@ impl<R: Read> Parser<R> {
         }
 
         Ok(result)
+    }
+
+    fn visit_null(&mut self) -> Result<(), ParseError> {
+        for expected in b"null".iter().copied() {
+            let got = self.next()?;
+            if expected != got {
+                return Err(ParseError::InvalidByte {
+                    byte: got,
+                    reason: format!(
+                        "expected {} scanning for null, got {}",
+                        expected as char, got as char
+                    ),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Collect exactly 4 hex digits from a JSON escape sequence (which is required to
@@ -1042,5 +1060,125 @@ mod tests {
     #[should_panic(expected = "more value types")]
     fn test_err_bool_case_sensitive() {
         let _ = parse_err("True");
+    }
+
+    // ==========================================
+    // Null Helpers
+    // ==========================================
+
+    /// Helper to ensure input parses specifically to Value::Null.
+    fn parse_null(input: &str) {
+        let mut parser = Parser::new(input.as_bytes());
+        let val = parser.parse().expect("Failed to parse null");
+        match val {
+            Value::Null => {} // OK
+            _ => panic!("Expected Value::Null, got {:?}", val),
+        }
+    }
+
+    /// Helper to assert an item in a slice is Value::Null
+    fn assert_array_null(arr: &[Value], index: usize) {
+        match &arr[index] {
+            Value::Null => {}
+            val => panic!("Expected Null at index {}, got {:?}", index, val),
+        }
+    }
+
+    /// Helper to check if a value in the map exists and is Value::Null
+    fn assert_is_null(map: &HashMap<String, Value>, key: &str) {
+        match map.get(key) {
+            Some(Value::Null) => {}
+            Some(v) => panic!("Key '{}' exists but is not Null. Got: {:?}", key, v),
+            None => panic!("Key '{}' not found in map", key),
+        }
+    }
+
+    // ==========================================
+    // Null Tests
+    // ==========================================
+
+    #[test]
+    fn test_null_basic() {
+        parse_null("null");
+    }
+
+    #[test]
+    fn test_null_whitespace() {
+        parse_null("  null  ");
+        parse_null("\n\tnull");
+    }
+
+    #[test]
+    fn test_array_of_nulls() {
+        let arr = parse_array("[null, null, null]");
+        assert_eq!(arr.len(), 3);
+        assert_array_null(&arr, 0);
+        assert_array_null(&arr, 1);
+        assert_array_null(&arr, 2);
+    }
+
+    #[test]
+    fn test_mixed_array_with_null() {
+        let arr = parse_array(r#"[ "s", null, true ]"#);
+        assert_eq!(arr.len(), 3);
+        assert_array_string(&arr, 0, "s");
+        assert_array_null(&arr, 1);
+        assert_array_bool(&arr, 2, true);
+    }
+
+    #[test]
+    fn test_object_with_null() {
+        let map = parse_object(r#"{ "empty_val": null, "defined": true }"#);
+        assert_is_null(&map, "empty_val");
+        assert_is_bool(&map, "defined", true);
+    }
+
+    #[test]
+    fn test_deep_null() {
+        let map = parse_object(r#"{ "a": [ { "b": null } ] }"#);
+        if let Value::Array(arr) = map.get("a").unwrap()
+            && let Value::Object(inner) = &arr[0]
+        {
+            assert_is_null(inner, "b");
+            return;
+        }
+        panic!("Structure mismatch");
+    }
+
+    // ==========================================
+    // Null Error Handling Tests
+    // ==========================================
+
+    #[test]
+    fn test_err_null_typo() {
+        let err = parse_err("nil");
+        match err {
+            ParseError::InvalidByte { byte: b'i', .. } => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_null_typo_end() {
+        let err = parse_err("nulL");
+        match err {
+            ParseError::InvalidByte { byte: b'L', .. } => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_null_incomplete() {
+        let err = parse_err("nu");
+        match err {
+            ParseError::UnexpectedEOF => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "more value types")]
+    fn test_err_null_case_sensitive() {
+        let _ = parse_err("Null");
     }
 }
