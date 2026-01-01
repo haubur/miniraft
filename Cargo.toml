@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["async-runtime", "domain", "kv", "miniraft", "serde", "util"]
+members = ["async-runtime", "domain", "json", "kv", "miniraft", "serde", "util"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,3 +11,4 @@ domain = { path = "domain" }
 serde = { path = "serde" }
 kv = { path = "kv" }
 util = { path = "util" }
+json = { path = "json" }

@@ -1,0 +1,6 @@
+[package]
+name = "json"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

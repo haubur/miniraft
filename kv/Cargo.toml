@@ -1,6 +1,6 @@
 [package]
 name = "kv"
-description = "Types and implementations for a key-value store"
+description = "Types and implementations for a key-value store, specific to Jepsen Maelstrom (https://github.com/jepsen-io/maelstrom/blob/cb7f07239012d85d2c0595fd942ddb4613205905/doc/06-raft/01-key-value.md)"
 version.workspace = true
 edition.workspace = true
 
