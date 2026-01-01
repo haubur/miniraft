@@ -8,10 +8,15 @@ use std::{
 
 const STRING_QUOTE: u8 = b'"';
 const STRING_ESCAPE_OPEN: u8 = b'\\';
+
 const OBJECT_OPEN: u8 = b'{';
 const OBJECT_KV_SEP: u8 = b':';
 const OBJECT_ENTRIES_SEP: u8 = b',';
 const OBJECT_CLOSE: u8 = b'}';
+
+const ARRAY_OPEN: u8 = b'[';
+const ARRAY_SEP: u8 = b',';
+const ARRAY_CLOSE: u8 = b']';
 
 #[derive(Debug)]
 pub enum Value {
@@ -120,6 +125,7 @@ impl<R: Read> Parser<R> {
         let val = match self.stream.peek() {
             Some(Ok(STRING_QUOTE)) => self.visit_string().map(Value::String)?,
             Some(Ok(OBJECT_OPEN)) => self.visit_object().map(Value::Object)?,
+            Some(Ok(ARRAY_OPEN)) => self.visit_array().map(Value::Array)?,
             _ => todo!("more value types"),
         };
         self.skip_whitespace()?;
@@ -127,11 +133,15 @@ impl<R: Read> Parser<R> {
         Ok(val)
     }
 
+    /// Skips all upcoming whitespace, if present.
     fn skip_whitespace(&mut self) -> Result<(), ParseError> {
         // If there's no whitespace, do not consume.
         while let Some(Ok(c)) = self.stream.peek() {
             if is_json_whitespace(*c) {
-                self.next()?; // Actually consume it.
+                // Actually consume it. I don't think this can genuinely error after
+                // having just successfully peeked, but it'd be a shame to unnecessarily
+                // panic; so just have this return a Result.
+                self.next()?;
             } else {
                 break;
             }
@@ -151,12 +161,12 @@ impl<R: Read> Parser<R> {
             };
         }
 
-        let mut map = HashMap::new();
-
         self.skip_whitespace()?;
 
+        let mut map = HashMap::new();
+
         // Early return for empty object
-        if let Some(Ok(b'}')) = self.stream.peek() {
+        if let Some(Ok(OBJECT_CLOSE)) = self.stream.peek() {
             let _ = self.next()?;
             return Ok(map);
         }
@@ -310,6 +320,45 @@ impl<R: Read> Parser<R> {
                             byte,
                         )));
                     }
+                }
+            }
+        }
+    }
+
+    fn visit_array(&mut self) -> Result<Vec<Value>, ParseError> {
+        {
+            let byte = self.next()?;
+            if byte != ARRAY_OPEN {
+                return Err(ParseError::InvalidByte {
+                    byte,
+                    reason: format!("expected {} for start of array", ARRAY_OPEN as char),
+                });
+            };
+        }
+
+        self.skip_whitespace()?;
+
+        let mut array = Vec::new();
+
+        // Early return for empty array
+        if let Some(Ok(ARRAY_CLOSE)) = self.stream.peek() {
+            let _ = self.next()?;
+            return Ok(array);
+        }
+
+        loop {
+            array.push(self.visit_value()?);
+            match self.next()? {
+                ARRAY_CLOSE => break Ok(array),
+                ARRAY_SEP => continue,
+                byte => {
+                    break Err(ParseError::InvalidByte {
+                        byte,
+                        reason: format!(
+                            "parsing array, need {} or {} after parsing an array element",
+                            ARRAY_CLOSE as char, ARRAY_SEP as char,
+                        ),
+                    });
                 }
             }
         }
@@ -681,5 +730,160 @@ mod tests {
             ParseError::InvalidByte { byte: b'1', .. } => {}
             _ => panic!("Wrong error type: {:?}", err),
         }
+    }
+
+    // ==========================================
+    // Array Helpers
+    // ==========================================
+
+    /// Helper to parse input directly into a Vec.
+    fn parse_array(input: &str) -> Vec<Value> {
+        let mut parser = Parser::new(input.as_bytes());
+        match parser.parse().expect("Failed to parse array") {
+            Value::Array(vec) => vec,
+            val => panic!("Expected Value::Array, got {:?}", val),
+        }
+    }
+
+    /// Helper to assert an item in a slice is a specific string
+    fn assert_array_string(arr: &[Value], index: usize, expected: &str) {
+        match &arr[index] {
+            Value::String(s) => assert_eq!(s, expected),
+            val => panic!("Expected String at index {}, got {:?}", index, val),
+        }
+    }
+
+    // ==========================================
+    // Array Tests
+    // ==========================================
+
+    #[test]
+    fn test_empty_array() {
+        let arr = parse_array("[]");
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn test_empty_array_with_whitespace() {
+        let arr = parse_array("  [ \n\t ]  ");
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn test_simple_string_array() {
+        let arr = parse_array(r#"[ "a", "b", "c" ]"#);
+        assert_eq!(arr.len(), 3);
+        assert_array_string(&arr, 0, "a");
+        assert_array_string(&arr, 1, "b");
+        assert_array_string(&arr, 2, "c");
+    }
+
+    #[test]
+    fn test_array_whitespace_variations() {
+        // Spaces around elements, commas, brackets
+        let arr = parse_array(r#"[ "one" , "two" ,"three" ]"#);
+        assert_eq!(arr.len(), 3);
+        assert_array_string(&arr, 0, "one");
+        assert_array_string(&arr, 1, "two");
+        assert_array_string(&arr, 2, "three");
+    }
+
+    #[test]
+    fn test_nested_arrays() {
+        let arr = parse_array(r#"[ ["x"], [] ]"#);
+        assert_eq!(arr.len(), 2);
+
+        // Check first element is ["x"]
+        match &arr[0] {
+            Value::Array(inner) => {
+                assert_eq!(inner.len(), 1);
+                assert_array_string(inner, 0, "x");
+            }
+            _ => panic!("Expected inner array at index 0"),
+        }
+
+        // Check second element is []
+        match &arr[1] {
+            Value::Array(inner) => assert!(inner.is_empty()),
+            _ => panic!("Expected inner array at index 1"),
+        }
+    }
+
+    #[test]
+    fn test_array_of_objects() {
+        let arr = parse_array(r#"[ {"name": "A"}, {"name": "B"} ]"#);
+        assert_eq!(arr.len(), 2);
+
+        match &arr[0] {
+            Value::Object(map) => assert_is_string(map, "name", "A"),
+            _ => panic!("Expected object at index 0"),
+        }
+
+        match &arr[1] {
+            Value::Object(map) => assert_is_string(map, "name", "B"),
+            _ => panic!("Expected object at index 1"),
+        }
+    }
+
+    #[test]
+    fn test_mixed_array() {
+        let arr = parse_array(r#"[ "start", {"key": "val"}, ["end"] ]"#);
+        assert_eq!(arr.len(), 3);
+
+        assert_array_string(&arr, 0, "start");
+
+        match &arr[1] {
+            Value::Object(map) => assert_is_string(map, "key", "val"),
+            _ => panic!("Index 1 incorrect"),
+        }
+
+        match &arr[2] {
+            Value::Array(inner) => assert_array_string(inner, 0, "end"),
+            _ => panic!("Index 2 incorrect"),
+        }
+    }
+
+    #[test]
+    fn test_object_containing_array() {
+        let map = parse_object(r#"{ "tags": ["rust", "json"] }"#);
+
+        match map.get("tags") {
+            Some(Value::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                assert_array_string(arr, 0, "rust");
+                assert_array_string(arr, 1, "json");
+            }
+            val => panic!("Expected array for key 'tags', got {:?}", val),
+        }
+    }
+
+    // ==========================================
+    // Array Error Handling Tests
+    // ==========================================
+
+    #[test]
+    fn test_err_array_missing_comma() {
+        let err = parse_err(r#"[ "a" "b" ]"#);
+        match err {
+            ParseError::InvalidByte { byte: b'"', reason } => {
+                assert!(reason.contains("need ] or ,"));
+            }
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_array_unclosed() {
+        let err = parse_err(r#"[ "open" "#);
+        match err {
+            ParseError::UnexpectedEOF => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "more value types")]
+    fn test_err_array_trailing_comma() {
+        let _ = parse_err(r#"[ "a", ]"#);
     }
 }
