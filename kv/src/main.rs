@@ -56,5 +56,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // assert_eq!(persistent, persistent_deserialized);
 
-    Ok(())
+    // Ok(())
 }

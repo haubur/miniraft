@@ -9,6 +9,8 @@ use std::{
 const STRING_QUOTE: u8 = b'"';
 const STRING_ESCAPE_OPEN: u8 = b'\\';
 const OBJECT_OPEN: u8 = b'{';
+const OBJECT_KV_SEP: u8 = b':';
+const OBJECT_ENTRIES_SEP: u8 = b',';
 const OBJECT_CLOSE: u8 = b'}';
 
 #[derive(Debug)]
@@ -33,8 +35,9 @@ pub enum UnicodeError {
 pub enum ParseError {
     Io(io::Error),
     UnexpectedEOF,
+    InvalidByte { byte: u8, reason: String },
     InvalidEscapeSequence(u8),
-    InvalidHex(char),
+    InvalidHexCharacter(char),
     UnicodeError(UnicodeError),
 }
 
@@ -57,10 +60,13 @@ impl Display for ParseError {
             Self::UnexpectedEOF => {
                 write!(f, "unexpected end of stream")
             }
+            Self::InvalidByte { byte, reason } => {
+                write!(f, "invalid byte: '{:x}' ({reason})", byte)
+            }
             Self::InvalidEscapeSequence(s) => {
                 write!(f, "invalid escape sequence: '{:x}'", s)
             }
-            Self::InvalidHex(c) => {
+            Self::InvalidHexCharacter(c) => {
                 write!(f, "invalid hexadecimal character: '{c}'")
             }
             Self::UnicodeError(UnicodeError::UnpairedUnicodeSurrogate(s)) => {
@@ -78,34 +84,54 @@ impl Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// A fully-featured, streaming JSON parser.
+///
+/// Spec: <https://www.json.org/json-en.html>
 pub struct Parser<R: Read> {
-    reader: Peekable<Bytes<BufReader<R>>>,
+    stream: Peekable<Bytes<BufReader<R>>>,
+    stream_pos: usize,
 }
 
 impl<R: Read> Parser<R> {
     pub fn new(reader: R) -> Self {
-        let bytes = BufReader::new(reader).bytes().peekable();
-        Self { reader: bytes }
+        let stream = BufReader::new(reader).bytes().peekable();
+
+        Self {
+            stream,
+            stream_pos: 0,
+        }
     }
 
     pub fn parse(&mut self) -> Result<Value, ParseError> {
         self.visit_value()
     }
 
+    /// Get the next byte from the underlying reader. Calling this method signals a
+    /// *need* for a next byte, thus if none is found (reader finished or errored), it
+    /// is considered an error.
+    fn next(&mut self) -> Result<u8, ParseError> {
+        let byte = self.stream.next().ok_or(ParseError::UnexpectedEOF)??;
+        self.stream_pos += 1;
+        Ok(byte)
+    }
+
     fn visit_value(&mut self) -> Result<Value, ParseError> {
         self.skip_whitespace()?;
-        match self.reader.next().ok_or(ParseError::UnexpectedEOF)?? {
-            STRING_QUOTE => self.visit_string(),
+        let val = match self.stream.peek() {
+            Some(Ok(STRING_QUOTE)) => self.visit_string().map(Value::String)?,
+            Some(Ok(OBJECT_OPEN)) => self.visit_object().map(Value::Object)?,
             _ => todo!("more value types"),
-        }
+        };
+        self.skip_whitespace()?;
+
+        Ok(val)
     }
 
     fn skip_whitespace(&mut self) -> Result<(), ParseError> {
         // If there's no whitespace, do not consume.
-        while let Some(Ok(c)) = self.reader.peek() {
+        while let Some(Ok(c)) = self.stream.peek() {
             if is_json_whitespace(*c) {
-                // Actually consume it.
-                self.reader.next().ok_or(ParseError::UnexpectedEOF)??;
+                self.next()?; // Actually consume it.
             } else {
                 break;
             }
@@ -114,23 +140,79 @@ impl<R: Read> Parser<R> {
         Ok(())
     }
 
-    fn parse_object(&mut self) -> Result<Value, ParseError> {
-        let v = Value::Object(HashMap::new());
-
-        assert_eq!(self.reader.next().expect("was peeked")?, OBJECT_OPEN);
-        self.skip_whitespace()?;
-
-        if let Some(Ok(b'}')) = self.reader.peek() {
-            // Empty object
-            return Ok(v);
+    fn visit_object(&mut self) -> Result<HashMap<String, Value>, ParseError> {
+        {
+            let byte = self.next()?;
+            if byte != OBJECT_OPEN {
+                return Err(ParseError::InvalidByte {
+                    byte,
+                    reason: format!("expected {} for start of object", OBJECT_OPEN as char),
+                });
+            };
         }
 
-        todo!("finish implementing object parsing")
+        let mut map = HashMap::new();
+
+        self.skip_whitespace()?;
+
+        // Early return for empty object
+        if let Some(Ok(b'}')) = self.stream.peek() {
+            let _ = self.next()?;
+            return Ok(map);
+        }
+
+        loop {
+            let key = self.visit_string()?;
+            self.skip_whitespace()?;
+            match self.next()? {
+                OBJECT_KV_SEP => { /* OK */ }
+                byte => {
+                    break Err(ParseError::InvalidByte {
+                        byte,
+                        reason: format!("parsing object, need {} after key", OBJECT_KV_SEP as char),
+                    });
+                }
+            }
+            let value = self.visit_value()?;
+
+            map.insert(key, value);
+
+            match self.next()? {
+                OBJECT_CLOSE => break Ok(map),
+                OBJECT_ENTRIES_SEP => {
+                    self.skip_whitespace()?;
+                    continue;
+                }
+                byte => {
+                    break Err(ParseError::InvalidByte {
+                        byte,
+                        reason: format!(
+                            "parsing object, need {} or {} after parsing a key/value pair",
+                            OBJECT_CLOSE as char, OBJECT_ENTRIES_SEP as char,
+                        ),
+                    });
+                }
+            }
+        }
     }
 
-    fn visit_string(&mut self) -> Result<Value, ParseError> {
+    fn visit_string(&mut self) -> Result<String, ParseError> {
+        {
+            let byte = self.next()?;
+            if byte != STRING_QUOTE {
+                return Err(ParseError::InvalidByte {
+                    byte,
+                    reason: format!("expected {} for start of string", STRING_QUOTE as char),
+                });
+            };
+        }
+
         let mut s = String::new();
 
+        // JSON uses UTF-16 to represent high code points. It's thus possible to
+        // encounter two back-to-back `\u1234` escape sequences, forming a surrogate
+        // pair. These need to be processed together; individually they are invalid.
+        // Thus we collect them, and flush runs of Unicode escapes out once they end.
         let mut codepoint_escapes: Vec<u16> = Vec::new();
         let flush_escapes = |cps: &mut Vec<u16>, s: &mut String| -> Result<(), ParseError> {
             let chars = char::decode_utf16(cps.iter().copied())
@@ -148,87 +230,85 @@ impl<R: Read> Parser<R> {
         };
 
         loop {
-            let c = self.reader.next().ok_or(ParseError::UnexpectedEOF)??;
-            match c {
+            match self.next()? {
                 STRING_QUOTE => {
                     flush_escapes(&mut codepoint_escapes, &mut s)?;
-                    return Ok(Value::String(s));
+                    break Ok(s);
                 }
-                STRING_ESCAPE_OPEN => {
-                    let c = self.reader.next().ok_or(ParseError::UnexpectedEOF)??;
-
-                    match c {
-                        b'"' => {
-                            flush_escapes(&mut codepoint_escapes, &mut s)?;
-                            s.push('"');
-                        }
-                        b'\\' => {
-                            flush_escapes(&mut codepoint_escapes, &mut s)?;
-                            s.push('\\');
-                        }
-                        b'/' => {
-                            flush_escapes(&mut codepoint_escapes, &mut s)?;
-                            s.push('/');
-                        }
-                        b'b' => {
-                            flush_escapes(&mut codepoint_escapes, &mut s)?;
-                            s.push('\x08');
-                        }
-                        b'f' => {
-                            flush_escapes(&mut codepoint_escapes, &mut s)?;
-                            s.push('\x0C');
-                        }
-                        b'n' => {
-                            flush_escapes(&mut codepoint_escapes, &mut s)?;
-                            s.push('\n');
-                        }
-                        b'r' => {
-                            flush_escapes(&mut codepoint_escapes, &mut s)?;
-                            s.push('\r');
-                        }
-                        b't' => {
-                            flush_escapes(&mut codepoint_escapes, &mut s)?;
-                            s.push('\t');
-                        }
-                        b'u' => {
-                            let codepoint = self.collect_hex()?;
-                            codepoint_escapes.push(codepoint);
-                        }
-                        b => return Err(ParseError::InvalidEscapeSequence(b)),
+                STRING_ESCAPE_OPEN => match self.next()? {
+                    b'"' => {
+                        flush_escapes(&mut codepoint_escapes, &mut s)?;
+                        s.push('"');
                     }
-                }
-                0..=127 => {
+                    b'\\' => {
+                        flush_escapes(&mut codepoint_escapes, &mut s)?;
+                        s.push('\\');
+                    }
+                    b'/' => {
+                        flush_escapes(&mut codepoint_escapes, &mut s)?;
+                        s.push('/');
+                    }
+                    b'b' => {
+                        flush_escapes(&mut codepoint_escapes, &mut s)?;
+                        s.push('\x08');
+                    }
+                    b'f' => {
+                        flush_escapes(&mut codepoint_escapes, &mut s)?;
+                        s.push('\x0C');
+                    }
+                    b'n' => {
+                        flush_escapes(&mut codepoint_escapes, &mut s)?;
+                        s.push('\n');
+                    }
+                    b'r' => {
+                        flush_escapes(&mut codepoint_escapes, &mut s)?;
+                        s.push('\r');
+                    }
+                    b't' => {
+                        flush_escapes(&mut codepoint_escapes, &mut s)?;
+                        s.push('\t');
+                    }
+                    b'u' => {
+                        let codepoint = self.collect_hex()?;
+                        codepoint_escapes.push(codepoint);
+                    }
+                    b => break Err(ParseError::InvalidEscapeSequence(b)),
+                },
+                byte @ 0..=127 => {
                     flush_escapes(&mut codepoint_escapes, &mut s)?;
-                    s.push(c as char); // ASCII: encoding == codepoint
+                    s.push(byte as char); // ASCII: encoding == codepoint
                 }
-                _ => {
+                byte => {
                     flush_escapes(&mut codepoint_escapes, &mut s)?;
 
                     debug_assert!(
-                        0b1000_0000 & c != 0,
+                        0b1000_0000 & byte != 0,
                         "MSB is zero, aka continuation bit exists"
                     );
                     let mut bytes = [0u8; 4];
-                    bytes[0] = c;
+                    bytes[0] = byte;
 
                     // Assume UTF8, and consume one code point. For pattern see
                     // https://en.wikipedia.org/wiki/UTF-8#Description. A bit repetitive
                     // below, but this way we only touch subsequent bytes if the start
-                    // byte looks OK.
-                    if 0b0010_0000u8 & c == 0 {
-                        bytes[1] = self.reader.next().ok_or(ParseError::UnexpectedEOF)??;
+                    // byte actually looks OK. The `str` will be stack-allocated, which
+                    // is a neat bonus.
+                    if 0b0010_0000u8 & byte == 0 {
+                        bytes[1] = self.next()?;
                         s.push_str(str::from_utf8(&bytes[..2])?);
-                    } else if 0b0001_0000u8 & c == 0 {
-                        bytes[1] = self.reader.next().ok_or(ParseError::UnexpectedEOF)??;
-                        bytes[2] = self.reader.next().ok_or(ParseError::UnexpectedEOF)??;
+                    } else if 0b0001_0000u8 & byte == 0 {
+                        bytes[1] = self.next()?;
+                        bytes[2] = self.next()?;
                         s.push_str(str::from_utf8(&bytes[..3])?);
-                    } else if 0b0000_1000u8 & c == 0 {
-                        bytes[1] = self.reader.next().ok_or(ParseError::UnexpectedEOF)??;
-                        bytes[2] = self.reader.next().ok_or(ParseError::UnexpectedEOF)??;
-                        bytes[3] = self.reader.next().ok_or(ParseError::UnexpectedEOF)??;
+                    } else if 0b0000_1000u8 & byte == 0 {
+                        bytes[1] = self.next()?;
+                        bytes[2] = self.next()?;
+                        bytes[3] = self.next()?;
                         s.push_str(str::from_utf8(&bytes[..4])?);
                     } else {
-                        return Err(ParseError::UnicodeError(UnicodeError::InvalidUTF8Start(c)));
+                        break Err(ParseError::UnicodeError(UnicodeError::InvalidUTF8Start(
+                            byte,
+                        )));
                     }
                 }
             }
@@ -243,10 +323,10 @@ impl<R: Read> Parser<R> {
         for _ in 0..4 {
             // Casting works because all hex digits are ASCII, where UTF8 encoding
             // corresponds to Unicode code points directly.
-            let c = self.reader.next().ok_or(ParseError::UnexpectedEOF)?? as char;
+            let c = self.next()? as char;
 
             // If it wasn't a hex but something malformed, it's caught here.
-            let digit = c.to_digit(16).ok_or(ParseError::InvalidHex(c))?;
+            let digit = c.to_digit(16).ok_or(ParseError::InvalidHexCharacter(c))?;
 
             val = (val << 4) | (digit as u16);
         }
@@ -428,7 +508,7 @@ mod tests {
         // 'z' is not hex
         let err = parse_err(r#""\u123z""#);
         match err {
-            ParseError::InvalidHex(c) => assert_eq!(c, 'z'),
+            ParseError::InvalidHexCharacter(c) => assert_eq!(c, 'z'),
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
@@ -439,7 +519,7 @@ mod tests {
         let err = parse_err(r#""\u12""#);
         match err {
             // It hits the quote '"' while expecting a hex digit
-            ParseError::InvalidHex(c) => assert_eq!(c, '"'),
+            ParseError::InvalidHexCharacter(c) => assert_eq!(c, '"'),
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
@@ -452,6 +532,153 @@ mod tests {
             ParseError::UnicodeError(UnicodeError::UnpairedUnicodeSurrogate(u)) => {
                 assert_eq!(u, 0xd800);
             }
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    // ==========================================
+    // Object Helpers
+    // ==========================================
+
+    /// Helper to parse input directly into a map.
+    fn parse_object(input: &str) -> HashMap<String, Value> {
+        let mut parser = Parser::new(input.as_bytes());
+        match parser.parse().expect("Failed to parse object") {
+            Value::Object(map) => map,
+            val => panic!("Expected Value::Object, got {:?}", val),
+        }
+    }
+
+    /// Helper to check if a value in the map exists and is a specific string.
+    fn assert_is_string(map: &HashMap<String, Value>, key: &str, expected: &str) {
+        match map.get(key) {
+            Some(Value::String(s)) => assert_eq!(s, expected),
+            Some(v) => panic!("Key '{}' exists but is not a string. Got: {:?}", key, v),
+            None => panic!("Key '{}' not found in map", key),
+        }
+    }
+
+    // ==========================================
+    // Object Tests
+    // ==========================================
+
+    #[test]
+    fn test_empty_object() {
+        let map = parse_object("{}");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_empty_object_with_whitespace() {
+        let map = parse_object("  {   }  ");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_simple_object() {
+        let map = parse_object(r#"{"foo": "bar"}"#);
+        assert_eq!(map.len(), 1);
+        assert_is_string(&map, "foo", "bar");
+    }
+
+    #[test]
+    fn test_object_multiple_keys() {
+        let map = parse_object(r#"{"name": "Alice", "city": "Wonderland"}"#);
+        assert_eq!(map.len(), 2);
+        assert_is_string(&map, "name", "Alice");
+        assert_is_string(&map, "city", "Wonderland");
+    }
+
+    #[test]
+    fn test_object_whitespace_variations() {
+        // Lots of spaces around colons and commas
+        let map = parse_object(r#"{ "a" : "b" , "c" : "d" }"#);
+        assert_eq!(map.len(), 2);
+        assert_is_string(&map, "a", "b");
+        assert_is_string(&map, "c", "d");
+    }
+
+    #[test]
+    fn test_unicode_keys() {
+        let map = parse_object(r#"{"🔥": "fire", "key": "🔑"}"#);
+        assert_eq!(map.len(), 2);
+        assert_is_string(&map, "🔥", "fire");
+        assert_is_string(&map, "key", "🔑");
+    }
+
+    #[test]
+    fn test_nested_object() {
+        let map = parse_object(r#"{"outer": {"inner": "value"}}"#);
+
+        // Unwrap the nested object
+        let inner_val = map.get("outer").expect("outer key missing");
+        match inner_val {
+            Value::Object(inner_map) => {
+                assert_is_string(inner_map, "inner", "value");
+            }
+            _ => panic!("Expected nested object, got {:?}", inner_val),
+        }
+    }
+
+    #[test]
+    fn test_deeply_nested_object() {
+        let input = r#"
+        {
+            "level1": {
+                "level2": {
+                    "level3": "found_me"
+                }
+            }
+        }"#;
+        let map = parse_object(input);
+
+        if let Value::Object(l2) = &map["level1"]
+            && let Value::Object(l3) = &l2["level2"]
+        {
+            assert_is_string(l3, "level3", "found_me");
+            return;
+        }
+        panic!("Deep structure not parsed correctly");
+    }
+
+    // ==========================================
+    // Object Error Handling Tests
+    // ==========================================
+
+    #[test]
+    fn test_err_object_trailing_comma() {
+        // Trailing commas are not allowed in standard JSON
+        let err = parse_err(r#"{"a": "b",}"#);
+        match err {
+            ParseError::InvalidByte { byte: b'}', .. } | ParseError::UnexpectedEOF => {}
+            _ => panic!("Expected InvalidByte or EOF, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_object_missing_colon() {
+        let err = parse_err(r#"{"key" "value"}"#);
+        match err {
+            ParseError::InvalidByte { byte: b'"', .. } => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_object_missing_comma() {
+        let err = parse_err(r#"{"a": "b" "c": "d"}"#);
+        match err {
+            ParseError::InvalidByte { byte: b'"', .. } => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_object_key_must_be_string() {
+        // Keys must be strings.
+        let err = parse_err(r#"{ 1: "b" }"#);
+        match err {
+            ParseError::InvalidByte { byte: b'1', .. } => {}
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
