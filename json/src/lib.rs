@@ -24,8 +24,7 @@ pub enum Value {
     Number(f64),
     Object(HashMap<String, Value>),
     Array(Vec<Value>),
-    True,
-    False,
+    Bool(bool),
     Null,
 }
 
@@ -126,6 +125,7 @@ impl<R: Read> Parser<R> {
             Some(Ok(STRING_QUOTE)) => self.visit_string().map(Value::String)?,
             Some(Ok(OBJECT_OPEN)) => self.visit_object().map(Value::Object)?,
             Some(Ok(ARRAY_OPEN)) => self.visit_array().map(Value::Array)?,
+            Some(Ok(b't')) | Some(Ok(b'f')) => self.visit_bool().map(Value::Bool)?,
             _ => todo!("more value types"),
         };
         self.skip_whitespace()?;
@@ -362,6 +362,34 @@ impl<R: Read> Parser<R> {
                 }
             }
         }
+    }
+
+    fn visit_bool(&mut self) -> Result<bool, ParseError> {
+        let (expected_remainder, result) = match self.next()? {
+            b't' => (b"rue".as_slice(), true),
+            b'f' => (b"alse".as_slice(), false),
+            byte => {
+                return Err(ParseError::InvalidByte {
+                    byte,
+                    reason: "expected t or f looking for beginning of boolean value".into(),
+                });
+            }
+        };
+
+        for expected in expected_remainder.iter().copied() {
+            let got = self.next()?;
+            if expected != got {
+                return Err(ParseError::InvalidByte {
+                    byte: got,
+                    reason: format!(
+                        "expected {} scanning boolean value, got {}",
+                        expected as char, got as char
+                    ),
+                });
+            }
+        }
+
+        Ok(result)
     }
 
     /// Collect exactly 4 hex digits from a JSON escape sequence (which is required to
@@ -885,5 +913,134 @@ mod tests {
     #[should_panic(expected = "more value types")]
     fn test_err_array_trailing_comma() {
         let _ = parse_err(r#"[ "a", ]"#);
+    }
+
+    // ==========================================
+    // Boolean Helpers
+    // ==========================================
+
+    /// Helper to parse input directly into a bool.
+    fn parse_bool(input: &str) -> bool {
+        let mut parser = Parser::new(input.as_bytes());
+        match parser.parse().expect("Failed to parse bool") {
+            Value::Bool(b) => b,
+            val => panic!("Expected Value::Bool, got {:?}", val),
+        }
+    }
+
+    /// Helper to assert an item in a slice is a specific bool
+    fn assert_array_bool(arr: &[Value], index: usize, expected: bool) {
+        match &arr[index] {
+            Value::Bool(b) => assert_eq!(*b, expected),
+            val => panic!("Expected Bool at index {}, got {:?}", index, val),
+        }
+    }
+
+    /// Helper to check if a value in the map exists and is a specific bool
+    fn assert_is_bool(map: &HashMap<String, Value>, key: &str, expected: bool) {
+        match map.get(key) {
+            Some(Value::Bool(b)) => assert_eq!(*b, expected),
+            Some(v) => panic!("Key '{}' exists but is not a bool. Got: {:?}", key, v),
+            None => panic!("Key '{}' not found in map", key),
+        }
+    }
+
+    // ==========================================
+    // Boolean Tests
+    // ==========================================
+
+    #[test]
+    fn test_bool_true() {
+        assert!(parse_bool("true"));
+    }
+
+    #[test]
+    fn test_bool_false() {
+        assert!(!parse_bool("false"));
+    }
+
+    #[test]
+    fn test_bool_whitespace() {
+        assert!(parse_bool("  true  "));
+        assert!(!parse_bool("\n\tfalse"));
+    }
+
+    #[test]
+    fn test_array_of_bools() {
+        let arr = parse_array("[true, false, true]");
+        assert_eq!(arr.len(), 3);
+        assert_array_bool(&arr, 0, true);
+        assert_array_bool(&arr, 1, false);
+        assert_array_bool(&arr, 2, true);
+    }
+
+    #[test]
+    fn test_object_with_bools() {
+        let map = parse_object(r#"{ "is_admin": true, "deleted": false }"#);
+        assert_is_bool(&map, "is_admin", true);
+        assert_is_bool(&map, "deleted", false);
+    }
+
+    #[test]
+    fn test_mixed_types_with_bool() {
+        let arr = parse_array(r#"[ "start", true, {"flag": false}, [true] ]"#);
+
+        assert_eq!(arr.len(), 4);
+
+        assert_array_string(&arr, 0, "start");
+
+        assert_array_bool(&arr, 1, true);
+
+        match &arr[2] {
+            Value::Object(map) => assert_is_bool(map, "flag", false),
+            _ => panic!("Index 2 incorrect"),
+        }
+
+        match &arr[3] {
+            Value::Array(inner) => assert_array_bool(inner, 0, true),
+            _ => panic!("Index 3 incorrect"),
+        }
+    }
+
+    // ==========================================
+    // Boolean Error Handling Tests
+    // ==========================================
+
+    #[test]
+    fn test_err_bool_typo_true() {
+        let err = parse_err("trus");
+        match err {
+            ParseError::InvalidByte { byte: b's', reason } => {
+                assert!(reason.contains("expected e"));
+                assert!(reason.contains("scanning boolean"));
+            }
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_bool_typo_false() {
+        let err = parse_err("falze");
+        match err {
+            ParseError::InvalidByte { byte: b'z', reason } => {
+                assert!(reason.contains("expected s"));
+            }
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_bool_incomplete() {
+        let err = parse_err("fal");
+        match err {
+            ParseError::UnexpectedEOF => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "more value types")]
+    fn test_err_bool_case_sensitive() {
+        let _ = parse_err("True");
     }
 }
