@@ -228,15 +228,11 @@ impl<R: Read> Parser<R> {
     }
 
     fn visit_object(&mut self) -> ParseResult<HashMap<String, Value>> {
-        {
-            let byte = self.advance()?;
-            if byte != OBJECT_OPEN {
-                return Err(self.err(InvalidByte {
-                    byte,
-                    reason: format!("expected {} for start of object", OBJECT_OPEN as char),
-                }));
-            };
-        }
+        assert_eq!(
+            self.advance()?,
+            OBJECT_OPEN,
+            "should only be reachable from visiting value, where it should be peeked correctly before visiting"
+        );
 
         self.skip_whitespace()?;
 
@@ -398,15 +394,11 @@ impl<R: Read> Parser<R> {
     }
 
     fn visit_array(&mut self) -> ParseResult<Vec<Value>> {
-        {
-            let byte = self.advance()?;
-            if byte != ARRAY_OPEN {
-                return Err(self.err(InvalidByte {
-                    byte,
-                    reason: format!("expected {} for start of array", ARRAY_OPEN as char),
-                }));
-            };
-        }
+        assert_eq!(
+            self.advance()?,
+            ARRAY_OPEN,
+            "should only be reachable from visiting value, where it should be peeked correctly before visiting"
+        );
 
         self.skip_whitespace()?;
 
@@ -440,12 +432,9 @@ impl<R: Read> Parser<R> {
         let (expected_remainder, result) = match self.advance()? {
             b't' => (b"rue".as_slice(), true),
             b'f' => (b"alse".as_slice(), false),
-            byte => {
-                return Err(self.err(InvalidByte {
-                    byte,
-                    reason: "expected t or f looking for beginning of boolean value".into(),
-                }));
-            }
+            _ => unreachable!(
+                "should only be reachable from visiting value, where it should be peeked correctly before visiting"
+            ),
         };
 
         for expected in expected_remainder.iter().copied() {
@@ -561,10 +550,9 @@ impl<R: Read> Parser<R> {
                     self.advance()?;
                 }
             }
-            byte => Err(self.err(InvalidByte {
-                byte,
-                reason: "expected digit or - scanning number".into(),
-            })),
+            _ => unreachable!(
+                "should only be reachable from visiting number, which is only reachable from visiting value, where it should be peeked correctly before visiting"
+            ),
         }
     }
 
@@ -700,6 +688,22 @@ mod tests {
     fn parse_err(input: &[u8]) -> error::Error {
         let mut parser = Parser::new(input);
         parser.parse().expect_err("Expected error but got success")
+    }
+
+    // ==========================================
+    // Basic value tests
+    // ==========================================
+
+    #[test]
+    fn test_parse_value_with_empty_input() {
+        let err = parse_err(b"");
+        match err {
+            error::Error {
+                kind: UnexpectedEOF,
+                ..
+            } => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
     }
 
     // ==========================================
@@ -1718,6 +1722,13 @@ mod tests {
     }
 
     #[test]
+    fn test_number_scientific_positive_multiple_digits() {
+        let n = parse_number("1.5e+11");
+        let f: f64 = n.try_into().unwrap();
+        assert_eq!(f, 150000000000.0);
+    }
+
+    #[test]
     fn test_number_scientific_negative() {
         let n = parse_number("1234e-2");
         let f: f64 = n.try_into().unwrap();
@@ -1811,6 +1822,30 @@ mod tests {
         match err {
             error::Error {
                 kind: UnexpectedEOF,
+                ..
+            } => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_number_exponent_with_invalid_char() {
+        let err = parse_err(b"1eA");
+        match err {
+            error::Error {
+                kind: InvalidByte { byte: b'A', .. },
+                ..
+            } => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_number_exponent_positive_with_invalid_char() {
+        let err = parse_err(b"1e+A");
+        match err {
+            error::Error {
+                kind: InvalidByte { byte: b'A', .. },
                 ..
             } => {}
             _ => panic!("Wrong error type: {:?}", err),
