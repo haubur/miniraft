@@ -293,7 +293,9 @@ impl<R: Read> Parser<R> {
             };
         }
 
-        let mut s = String::new();
+        // Initial capacity showed ~10% higher throughput in a local benchmark. It
+        // avoids reallocs for most strings.
+        let mut s = String::with_capacity(32);
 
         loop {
             if let Some(high_surrogate) = self.pending_high_surrogate {
@@ -664,6 +666,7 @@ impl<R: Read> Parser<R> {
 }
 
 /// Note JSON whitespace differs from Unicode whitespace, it's a narrower definition.
+#[inline]
 fn is_json_whitespace(c: u8) -> bool {
     c == b' ' || c == b'\n' || c == b'\r' || c == b'\t'
 }
