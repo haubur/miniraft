@@ -3,42 +3,35 @@
 version = 4
 
 [[package]]
-name = "async-runtime"
+name = "base64"
 version = "0.1.0"
-
-[[package]]
-name = "domain"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "json"
 version = "0.1.0"
+dependencies = [
+ "base64",
+]
 
 [[package]]
 name = "kv"
 version = "0.1.0"
 dependencies = [
  "json",
- "serde",
+ "maelstrom",
+ "raft",
 ]
 
 [[package]]
-name = "miniraft"
+name = "maelstrom"
 version = "0.1.0"
 dependencies = [
- "domain",
- "kv",
- "serde",
- "util",
+ "json",
 ]
 
 [[package]]
-name = "serde"
+name = "raft"
 version = "0.1.0"
-
-[[package]]
-name = "util"
-version = "0.1.0"
+dependencies = [
+ "json",
+]

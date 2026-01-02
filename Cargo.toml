@@ -1,17 +1,17 @@
 [workspace]
 resolver = "3"
-members = ["async-runtime", "domain", "json", "kv", "miniraft", "serde", "util"]
+members = ["raft", "json", "kv", "base64", "maelstrom"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-domain = { path = "domain" }
-serde = { path = "serde" }
-kv = { path = "kv" }
-util = { path = "util" }
+base64 = { path = "base64" }
+maelstrom = { path = "maelstrom" }
 json = { path = "json" }
+kv = { path = "kv" }
+raft = { path = "raft" }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
@@ -20,8 +20,6 @@ missing_debug_implementations = "warn"
 cast_possible_truncation = "warn"
 dbg_macro = "deny"
 indexing_slicing = "deny"
-print_stderr = "warn"
-print_stdout = "warn"
 todo = "warn"
 unwrap_used = "deny"
 wildcard_imports = "deny"

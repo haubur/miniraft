@@ -1,8 +1,7 @@
-use std::fmt::Debug;
+use std::{collections::HashMap, fmt::Debug};
 
-use serde::{Deserialize, Serialize};
+use json::{Value as JSONValue, conversions::from_value::TryFromError};
 
-#[derive(Default, PartialEq)]
 pub struct Put {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
@@ -17,24 +16,35 @@ impl Debug for Put {
     }
 }
 
-impl Serialize for Put {
-    fn serialize(&self, writer: &mut impl std::io::Write) -> Result<(), serde::SerializeError> {
-        self.key.as_slice().serialize(writer)?;
-        self.value.as_slice().serialize(writer)
+impl From<&Put> for JSONValue {
+    fn from(value: &Put) -> Self {
+        Self::Object(HashMap::from([
+            ("key".to_string(), value.key.as_slice().into()),
+            ("value".to_string(), value.value.as_slice().into()),
+        ]))
     }
 }
 
-impl Deserialize for Put {
-    fn deserialize_into(
-        &mut self,
-        reader: &mut impl std::io::Read,
-    ) -> Result<(), serde::DeserializeError>
-    where
-        Self: Sized,
-    {
-        Vec::<u8>::deserialize_into(&mut self.key, reader)?;
-        Vec::<u8>::deserialize_into(&mut self.value, reader)?;
+impl TryFrom<JSONValue> for Put {
+    type Error = TryFromError;
 
-        Ok(())
+    fn try_from(value: JSONValue) -> Result<Self, Self::Error> {
+        if let JSONValue::Object(mut map) = value {
+            match (map.remove("key"), map.remove("value")) {
+                (Some(key), Some(value)) => Ok(Self {
+                    key: key.try_into()?,
+                    value: value.try_into()?,
+                }),
+                _ => Err(TryFromError {
+                    value: JSONValue::Object(map),
+                    reason: None,
+                }),
+            }
+        } else {
+            Err(TryFromError {
+                value,
+                reason: None,
+            })
+        }
     }
 }

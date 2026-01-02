@@ -5,5 +5,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-serde.workspace = true
 json.workspace = true
+maelstrom.workspace = true
+raft.workspace = true
+
+[lints]
+workspace = true

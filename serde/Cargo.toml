@@ -1,7 +1,0 @@
-[package]
-name = "serde"
-description = "Traits and implementations for simple serialization and deserialization"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]

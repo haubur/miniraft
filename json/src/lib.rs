@@ -1,12 +1,14 @@
 use std::{
     collections::HashMap,
+    fmt::{Display, Write},
     io::{BufReader, Bytes, Read},
     iter::Peekable,
-    num::{NonZero, ParseFloatError, ParseIntError},
+    num::NonZero,
     str,
 };
 
 pub mod error;
+pub mod serde;
 
 // Make all kinds usable directly, less boilerplate.
 use error::Kind::*;
@@ -39,6 +41,73 @@ pub enum Value {
     Array(Vec<Value>),
     Bool(bool),
     Null,
+}
+
+/// Prints the JSON, non-pretty string representation of [`Value`].
+impl Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::String(s) => {
+                let mut buf = String::with_capacity(s.len());
+                for c in s.chars() {
+                    // Handle escapes.
+                    match c {
+                        '"' => buf.push_str(r#"\""#),
+                        '\\' => buf.push_str(r#"\\"#),
+
+                        // Could legally also fall through to `\uXXXX` below but these
+                        // look nicer for common values.
+                        '\n' => buf.push_str(r#"\n"#),
+                        '\t' => buf.push_str(r#"\t"#),
+                        '\r' => buf.push_str(r#"\r"#),
+                        '\x08' => buf.push_str(r#"\b"#),
+                        '\x0c' => buf.push_str(r#"\f"#),
+
+                        c if c.is_control() => write!(buf, "\\u{:04x}", c as u32)?,
+                        _ => buf.push(c),
+                    }
+                }
+                write!(f, "{}{}{}", STRING_QUOTE as char, buf, STRING_QUOTE as char)
+            }
+            Value::Number(num) => {
+                // Assumption: echoing number back verbatim is OK because it can only be
+                // constructed from parsing incoming JSON, at which point it is
+                // validated and rejected if invalid.
+                write!(f, "{}", num.0)
+            }
+            Value::Object(obj) => {
+                write!(f, "{}", OBJECT_OPEN as char)?;
+                let mut first = true;
+                for (k, v) in obj.iter() {
+                    if !first {
+                        write!(f, "{} ", OBJECT_ENTRIES_SEP as char)?;
+                    }
+                    write!(f, "\"{}\"{} ", k, OBJECT_KV_SEP as char)?;
+                    write!(f, "{}", v)?;
+                    first = false;
+                }
+                write!(f, "{}", OBJECT_CLOSE as char)?;
+
+                Ok(())
+            }
+            Value::Array(values) => {
+                write!(f, "{}", ARRAY_OPEN as char)?;
+                let mut first = true;
+                for v in values.iter() {
+                    if !first {
+                        write!(f, "{} ", ARRAY_SEP as char)?;
+                    }
+                    write!(f, "{}", v)?;
+                    first = false;
+                }
+                write!(f, "{}", ARRAY_CLOSE as char)?;
+
+                Ok(())
+            }
+            Value::Bool(b) => write!(f, "{b}"),
+            Value::Null => write!(f, "null"),
+        }
+    }
 }
 
 /// A JSON number.
@@ -78,55 +147,263 @@ impl PartialEq for Number {
     }
 }
 
-impl TryFrom<Number> for u64 {
-    type Error = ParseIntError;
+/// Convenience conversion implementations for [`Value`] and common stdlib types.
+///
+/// This muddles the waters a bit and mixes JSON and the higher-level concept of
+/// "serialization" (independent of JSON) but it works...
+pub mod conversions {
+    pub mod to_value {
+        use crate::{Number, Value};
 
-    fn try_from(value: Number) -> Result<Self, Self::Error> {
-        value.0.parse()
+        impl From<String> for Value {
+            fn from(value: String) -> Self {
+                Self::String(value)
+            }
+        }
+
+        impl From<&str> for Value {
+            fn from(value: &str) -> Self {
+                value.to_string().into()
+            }
+        }
+
+        impl From<&[u8]> for Value {
+            fn from(value: &[u8]) -> Self {
+                Self::String(base64::encode(value))
+            }
+        }
+
+        impl From<u64> for Value {
+            fn from(value: u64) -> Self {
+                Value::Number(Number(value.to_string()))
+            }
+        }
+
+        impl From<i64> for Value {
+            fn from(value: i64) -> Self {
+                Value::Number(Number(value.to_string()))
+            }
+        }
+
+        impl From<f64> for Value {
+            fn from(value: f64) -> Self {
+                Value::Number(Number(value.to_string()))
+            }
+        }
+
+        impl<T> From<&[T]> for Value
+        where
+            for<'a> Value: From<&'a T>,
+        {
+            fn from(value: &[T]) -> Self {
+                Value::Array(value.iter().map(Into::into).collect())
+            }
+        }
+
+        impl<T> From<&Option<T>> for Value
+        where
+            for<'a> Value: From<&'a T>,
+        {
+            fn from(value: &Option<T>) -> Self {
+                match value {
+                    Some(v) => v.into(),
+                    None => Value::Null,
+                }
+            }
+        }
+
+        impl From<bool> for Value {
+            fn from(value: bool) -> Self {
+                Value::Bool(value)
+            }
+        }
+    }
+
+    pub mod from_value {
+        use crate::{Number, Value};
+        use std::num::{ParseFloatError, ParseIntError};
+
+        /// An error to signal unsuccessful conversion from [`Value`] to some target
+        /// type.
+        #[derive(Debug)]
+        pub struct TryFromError {
+            /// The invalid value for this conversion.
+            pub value: Value,
+            /// Underlying error, if any.
+            pub reason: Option<Box<dyn std::error::Error>>,
+        }
+
+        impl std::fmt::Display for TryFromError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "conversion error for value '{:?}' ", self.value)?;
+                match &self.reason {
+                    Some(r) => write!(f, "(reason: {})", r),
+                    None => write!(f, "(no reason)"),
+                }
+            }
+        }
+
+        impl std::error::Error for TryFromError {}
+
+        impl TryFrom<Value> for String {
+            type Error = TryFromError;
+
+            fn try_from(value: Value) -> Result<Self, Self::Error> {
+                if let Value::String(s) = value {
+                    Ok(s)
+                } else {
+                    Err(TryFromError {
+                        value,
+                        reason: None,
+                    })
+                }
+            }
+        }
+
+        impl TryFrom<Value> for Vec<u8> {
+            type Error = TryFromError;
+
+            fn try_from(value: Value) -> Result<Self, Self::Error> {
+                match value {
+                    Value::String(s) => base64::decode(&s).map_err(|err| TryFromError {
+                        value: Value::String(s),
+                        reason: Some(err.into()),
+                    }),
+                    // Could also support array of numbers 0-255, like serde.
+                    _ => Err(TryFromError {
+                        value,
+                        reason: None,
+                    }),
+                }
+            }
+        }
+
+        impl TryFrom<Value> for u64 {
+            type Error = TryFromError;
+
+            fn try_from(value: Value) -> Result<Self, Self::Error> {
+                if let Value::Number(ref num) = value {
+                    num.try_into()
+                        .map_err(|e: std::num::ParseIntError| TryFromError {
+                            value,
+                            reason: Some(e.into()),
+                        })
+                } else {
+                    Err(TryFromError {
+                        value,
+                        reason: None,
+                    })
+                }
+            }
+        }
+
+        impl TryFrom<Value> for f64 {
+            type Error = TryFromError;
+
+            fn try_from(value: Value) -> Result<Self, Self::Error> {
+                if let Value::Number(ref num) = value {
+                    num.try_into().map_err(|e: ParseFloatError| TryFromError {
+                        value,
+                        reason: Some(e.into()),
+                    })
+                } else {
+                    Err(TryFromError {
+                        value,
+                        reason: None,
+                    })
+                }
+            }
+        }
+
+        impl<T> TryFrom<Value> for Vec<T>
+        where
+            T: TryFrom<Value, Error = TryFromError>,
+        {
+            type Error = TryFromError;
+
+            fn try_from(value: Value) -> Result<Self, Self::Error> {
+                if let Value::Array(values) = value {
+                    let mut items = Vec::with_capacity(values.len());
+                    for v in values {
+                        let item: T = v.try_into()?;
+                        items.push(item);
+                    }
+
+                    Ok(items)
+                } else {
+                    Err(TryFromError {
+                        value,
+                        reason: None,
+                    })
+                }
+            }
+        }
+
+        impl<T> TryFrom<Value> for Option<T>
+        where
+            T: TryFrom<Value, Error = TryFromError>,
+        {
+            type Error = TryFromError;
+
+            fn try_from(value: Value) -> Result<Self, Self::Error> {
+                match value {
+                    Value::Null => Ok(None),
+                    v => Ok(Some(v.try_into()?)),
+                }
+            }
+        }
+
+        impl TryFrom<Number> for u64 {
+            type Error = ParseIntError;
+
+            fn try_from(value: Number) -> Result<Self, Self::Error> {
+                value.0.parse()
+            }
+        }
+
+        impl TryFrom<&Number> for u64 {
+            type Error = ParseIntError;
+
+            fn try_from(value: &Number) -> Result<Self, Self::Error> {
+                value.0.parse()
+            }
+        }
+
+        impl TryFrom<Number> for i64 {
+            type Error = ParseIntError;
+
+            fn try_from(value: Number) -> Result<Self, Self::Error> {
+                value.0.parse()
+            }
+        }
+
+        impl TryFrom<&Number> for i64 {
+            type Error = ParseIntError;
+
+            fn try_from(value: &Number) -> Result<Self, Self::Error> {
+                value.0.parse()
+            }
+        }
+
+        impl TryFrom<Number> for f64 {
+            type Error = ParseFloatError;
+
+            fn try_from(value: Number) -> Result<Self, Self::Error> {
+                value.0.parse()
+            }
+        }
+
+        impl TryFrom<&Number> for f64 {
+            type Error = ParseFloatError;
+
+            fn try_from(value: &Number) -> Result<Self, Self::Error> {
+                value.0.parse()
+            }
+        }
     }
 }
 
-impl TryFrom<&Number> for u64 {
-    type Error = ParseIntError;
-
-    fn try_from(value: &Number) -> Result<Self, Self::Error> {
-        value.0.parse()
-    }
-}
-
-impl TryFrom<Number> for i64 {
-    type Error = ParseIntError;
-
-    fn try_from(value: Number) -> Result<Self, Self::Error> {
-        value.0.parse()
-    }
-}
-
-impl TryFrom<&Number> for i64 {
-    type Error = ParseIntError;
-
-    fn try_from(value: &Number) -> Result<Self, Self::Error> {
-        value.0.parse()
-    }
-}
-
-impl TryFrom<Number> for f64 {
-    type Error = ParseFloatError;
-
-    fn try_from(value: Number) -> Result<Self, Self::Error> {
-        value.0.parse()
-    }
-}
-
-impl TryFrom<&Number> for f64 {
-    type Error = ParseFloatError;
-
-    fn try_from(value: &Number) -> Result<Self, Self::Error> {
-        value.0.parse()
-    }
-}
-
-/// A fully-featured, streaming JSON parser.
+/// A fully-featured, "streaming" JSON parser.
 ///
 /// Spec: <https://www.json.org/json-en.html>
 #[derive(Debug)]
@@ -1956,6 +2233,101 @@ mod tests {
         // are unequal.
         assert_ne!(num("NaN"), num("null"));
         assert_ne!(num("abc"), num("def"));
+    }
+
+    // ==========================================
+    // Printing tests
+    // ==========================================
+
+    #[test]
+    fn test_print_string() {
+        let val = Value::String("hello world 🔥".into());
+
+        let expected = r#""hello world 🔥""#;
+        assert_eq!(val.to_string(), expected);
+    }
+
+    #[test]
+    fn test_print_string_escaping() {
+        let val = Value::String("hello\nworld\t \"foo\" \\ \x00 \x07 ".into());
+
+        let expected = r#""hello\nworld\t \"foo\" \\ \u0000 \u0007 ""#;
+        assert_eq!(val.to_string(), expected);
+    }
+
+    #[test]
+    fn test_print_bool() {
+        let val = Value::Bool(true);
+
+        let expected = "true";
+        assert_eq!(val.to_string(), expected);
+
+        let val = Value::Bool(false);
+
+        let expected = "false";
+        assert_eq!(val.to_string(), expected);
+    }
+
+    #[test]
+    fn test_print_null() {
+        let val = Value::Null;
+
+        let expected = "null";
+        assert_eq!(val.to_string(), expected);
+    }
+
+    #[test]
+    fn test_print_number() {
+        let val = Value::Number(Number("123.2".into()));
+
+        let expected = "123.2";
+        assert_eq!(val.to_string(), expected);
+
+        let val = Value::Number(Number("-0".into()));
+
+        let expected = "-0";
+        assert_eq!(val.to_string(), expected);
+    }
+
+    #[test]
+    fn test_print_array() {
+        // Single element
+        let val = Value::Array(vec![Value::String("foo".into())]);
+
+        let expected = r#"["foo"]"#;
+        assert_eq!(val.to_string(), expected);
+
+        // Multiple elements
+        let val = Value::Array(vec![
+            Value::String("foo".into()),
+            Value::String("bar".into()),
+            Value::String("baz".into()),
+        ]);
+
+        let expected = r#"["foo", "bar", "baz"]"#;
+        assert_eq!(val.to_string(), expected);
+    }
+
+    #[test]
+    fn test_print_object() {
+        // Single element
+        let val = Value::Object(HashMap::from([("foo".into(), Value::String("bar".into()))]));
+
+        let expected = r#"{"foo": "bar"}"#;
+        assert_eq!(val.to_string(), expected);
+
+        // Multiple elements
+        let val = Value::Object(HashMap::from([
+            ("foo".into(), Value::String("bar".into())),
+            ("baz".into(), Value::String("qux".into())),
+        ]));
+
+        // Key order is indeterministic
+        let expected1 = r#"{"foo": "bar", "baz": "qux"}"#;
+        let expected2 = r#"{"baz": "qux", "foo": "bar"}"#;
+        let s = val.to_string();
+
+        assert!(s == expected1 || s == expected2);
     }
 
     // ==========================================
