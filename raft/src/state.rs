@@ -241,9 +241,18 @@ mod tests {
             ],
         };
 
-        let json = there.serialize().unwrap();
-        let back = Persistent::<TestCommand>::deserialize(json).unwrap();
+        // In-memory values only
+        let val = there.serialize().unwrap();
+        let back = Persistent::<TestCommand>::deserialize(val).unwrap();
 
         assert_eq!(there, back);
+
+        let json_string_there = there.serialize().unwrap().to_string();
+        let back_parsed = Persistent::<TestCommand>::deserialize(
+            json::parse(json_string_there.as_bytes()).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(there, back_parsed);
     }
 }
