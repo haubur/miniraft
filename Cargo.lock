@@ -21,6 +21,7 @@ version = "0.1.0"
 name = "kv"
 version = "0.1.0"
 dependencies = [
+ "json",
  "serde",
 ]
 

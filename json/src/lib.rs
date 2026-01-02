@@ -19,6 +19,12 @@ const ARRAY_OPEN: u8 = b'[';
 const ARRAY_SEP: u8 = b',';
 const ARRAY_CLOSE: u8 = b']';
 
+pub fn parse(data: &[u8]) -> Result<Value, ParseError> {
+    let mut parser = Parser::new(data);
+
+    parser.parse()
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Value {
     String(String),
