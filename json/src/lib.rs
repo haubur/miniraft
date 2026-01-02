@@ -1,11 +1,15 @@
 use std::{
     collections::HashMap,
-    fmt::Display,
-    io::{self, BufReader, Bytes, Read},
+    io::{BufReader, Bytes, Read},
     iter::Peekable,
-    num::{ParseFloatError, ParseIntError},
+    num::{NonZero, ParseFloatError, ParseIntError},
     str,
 };
+
+pub mod error;
+
+// Make all kinds usable directly, less boilerplate.
+use error::Kind::*;
 
 const STRING_QUOTE: u8 = b'"';
 const STRING_ESCAPE_OPEN: u8 = b'\\';
@@ -19,7 +23,9 @@ const ARRAY_OPEN: u8 = b'[';
 const ARRAY_SEP: u8 = b',';
 const ARRAY_CLOSE: u8 = b']';
 
-pub fn parse(data: &[u8]) -> Result<Value, ParseError> {
+type ParseResult<T> = std::result::Result<T, error::Error>;
+
+pub fn parse(data: &[u8]) -> ParseResult<Value> {
     let mut parser = Parser::new(data);
 
     parser.parse()
@@ -120,99 +126,69 @@ impl TryFrom<&Number> for f64 {
     }
 }
 
-#[derive(Debug)]
-pub enum UnicodeError {
-    UnpairedUnicodeSurrogate(u16),
-    InvalidUTF8(str::Utf8Error),
-    InvalidUTF8Start(u8),
-}
-
-#[derive(Debug)]
-pub enum ParseError {
-    Io(io::Error),
-    UnexpectedEOF,
-    InvalidByte { byte: u8, reason: String },
-    InvalidEscapeSequence(u8),
-    InvalidHexCharacter(char),
-    UnicodeError(UnicodeError),
-}
-
-impl From<io::Error> for ParseError {
-    fn from(value: io::Error) -> Self {
-        Self::Io(value)
-    }
-}
-
-impl From<str::Utf8Error> for ParseError {
-    fn from(value: str::Utf8Error) -> Self {
-        Self::UnicodeError(UnicodeError::InvalidUTF8(value))
-    }
-}
-
-impl Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(err) => write!(f, "i/o error: {err}"),
-            Self::UnexpectedEOF => {
-                write!(f, "unexpected end of stream")
-            }
-            Self::InvalidByte { byte, reason } => {
-                write!(f, "invalid byte: '{:x}' ({reason})", byte)
-            }
-            Self::InvalidEscapeSequence(s) => {
-                write!(f, "invalid escape sequence: '{:x}'", s)
-            }
-            Self::InvalidHexCharacter(c) => {
-                write!(f, "invalid hexadecimal character: '{c}'")
-            }
-            Self::UnicodeError(UnicodeError::UnpairedUnicodeSurrogate(s)) => {
-                write!(f, "unpaired Unicode surrogate: '{:x}'", s)
-            }
-            Self::UnicodeError(UnicodeError::InvalidUTF8(err)) => {
-                write!(f, "UTF8 error: '{:?}'", err)
-            }
-            Self::UnicodeError(UnicodeError::InvalidUTF8Start(byte)) => {
-                write!(f, "invalid UTF8 start byte: '{:x}'", byte)
-            }
-        }
-    }
-}
-
-impl std::error::Error for ParseError {}
-
 /// A fully-featured, streaming JSON parser.
 ///
 /// Spec: <https://www.json.org/json-en.html>
 pub struct Parser<R: Read> {
     stream: Peekable<Bytes<BufReader<R>>>,
+    /// Bytes read from stream so far.
     stream_pos: usize,
+
+    /// When processing UTF16 JSON escapes like `\u1234` in JSON strings, surrogate
+    /// pairs might be encountered. This slot tracks encountered high surrogates,
+    /// pending pairing with a subsequent low surrogate (at which point the slot is
+    /// cleared again).
+    pending_high_surrogate: Option<NonZero<u16>>,
 }
 
 impl<R: Read> Parser<R> {
+    /// Constructs a new parser over the reader implementation. The parser will be
+    /// buffered.
     pub fn new(reader: R) -> Self {
         let stream = BufReader::new(reader).bytes().peekable();
 
         Self {
             stream,
             stream_pos: 0,
+            pending_high_surrogate: None,
         }
     }
 
-    pub fn parse(&mut self) -> Result<Value, ParseError> {
+    /// Entrypoint into parsing. Will try to parse the input as a [JSON
+    /// *value*](https://www.json.org/json-en.html).
+    pub fn parse(&mut self) -> ParseResult<Value> {
         self.visit_value()
     }
 
     /// Get the next byte from the underlying reader. Calling this method signals a
     /// *need* for a next byte, thus if none is found (reader finished or errored), it
     /// is considered an error.
-    fn advance(&mut self) -> Result<u8, ParseError> {
-        let byte = self.stream.next().ok_or(ParseError::UnexpectedEOF)??;
+    fn advance(&mut self) -> ParseResult<u8> {
+        let byte = self
+            .stream
+            .next()
+            .ok_or(self.err(UnexpectedEOF))?
+            .map_err(|io_err| self.err(Io(io_err)))?;
         self.stream_pos += 1;
         Ok(byte)
     }
 
-    fn visit_value(&mut self) -> Result<Value, ParseError> {
+    /// Construct an error of the provided kind, with information from current parser
+    /// state.
+    fn err(&self, kind: error::Kind) -> error::Error {
+        error::Error {
+            kind,
+            pos: self.stream_pos,
+        }
+    }
+
+    fn visit_value(&mut self) -> ParseResult<Value> {
         self.skip_whitespace()?;
+
+        // Peek ahead, but leave actual token consumption to implementations themselves.
+        // This keeps it symmetrical. The individual functions are essentially the
+        // diagrams at <https://www.json.org/json-en.html>, where e.g. `object` is
+        // responsible for its own `{` and `}` handling.
         let val = match self.stream.peek() {
             Some(Ok(STRING_QUOTE)) => self.visit_string().map(Value::String)?,
             Some(Ok(OBJECT_OPEN)) => self.visit_object().map(Value::Object)?,
@@ -220,13 +196,13 @@ impl<R: Read> Parser<R> {
             Some(Ok(b't')) | Some(Ok(b'f')) => self.visit_bool().map(Value::Bool)?,
             Some(Ok(b'n')) => self.visit_null().map(|_| Value::Null)?,
             Some(Ok(b'-')) | Some(Ok(b'0'..=b'9')) => self.visit_number().map(Value::Number)?,
-            Some(Ok(byte)) => {
-                return Err(ParseError::InvalidByte {
-                    byte: *byte,
+            Some(&Ok(byte /* Copy out */)) => {
+                return Err(self.err(InvalidByte {
+                    byte,
                     reason: "invalid byte looking for beginning of value".into(),
-                });
+                }));
             }
-            _ => return Err(ParseError::UnexpectedEOF),
+            _ => return Err(self.err(UnexpectedEOF)),
         };
         self.skip_whitespace()?;
 
@@ -234,7 +210,7 @@ impl<R: Read> Parser<R> {
     }
 
     /// Skips all upcoming whitespace, if present.
-    fn skip_whitespace(&mut self) -> Result<(), ParseError> {
+    fn skip_whitespace(&mut self) -> ParseResult<()> {
         // If there's no whitespace, do not consume.
         while let Some(Ok(c)) = self.stream.peek() {
             if is_json_whitespace(*c) {
@@ -250,14 +226,14 @@ impl<R: Read> Parser<R> {
         Ok(())
     }
 
-    fn visit_object(&mut self) -> Result<HashMap<String, Value>, ParseError> {
+    fn visit_object(&mut self) -> ParseResult<HashMap<String, Value>> {
         {
             let byte = self.advance()?;
             if byte != OBJECT_OPEN {
-                return Err(ParseError::InvalidByte {
+                return Err(self.err(InvalidByte {
                     byte,
                     reason: format!("expected {} for start of object", OBJECT_OPEN as char),
-                });
+                }));
             };
         }
 
@@ -277,10 +253,13 @@ impl<R: Read> Parser<R> {
             match self.advance()? {
                 OBJECT_KV_SEP => { /* OK */ }
                 byte => {
-                    break Err(ParseError::InvalidByte {
+                    break Err(self.err(InvalidByte {
                         byte,
-                        reason: format!("parsing object, need {} after key", OBJECT_KV_SEP as char),
-                    });
+                        reason: format!(
+                            "parsing object, expected {} after key",
+                            OBJECT_KV_SEP as char
+                        ),
+                    }));
                 }
             }
             let value = self.visit_value()?;
@@ -294,107 +273,94 @@ impl<R: Read> Parser<R> {
                     continue;
                 }
                 byte => {
-                    break Err(ParseError::InvalidByte {
+                    break Err(self.err(InvalidByte {
                         byte,
                         reason: format!(
-                            "parsing object, need {} or {} after parsing a key/value pair",
+                            "parsing object, expected {} or {} after parsing a key/value pair",
                             OBJECT_CLOSE as char, OBJECT_ENTRIES_SEP as char,
                         ),
-                    });
+                    }));
                 }
             }
         }
     }
 
-    fn visit_string(&mut self) -> Result<String, ParseError> {
+    fn visit_string(&mut self) -> ParseResult<String> {
         {
             let byte = self.advance()?;
             if byte != STRING_QUOTE {
-                return Err(ParseError::InvalidByte {
+                return Err(self.err(InvalidByte {
                     byte,
                     reason: format!("expected {} for start of string", STRING_QUOTE as char),
-                });
+                }));
             };
         }
 
         let mut s = String::new();
 
-        // JSON uses UTF-16 to represent high code points. It's thus possible to
-        // encounter two back-to-back `\u1234` escape sequences, forming a surrogate
-        // pair. These need to be processed together; individually they are invalid.
-        // Thus we collect them, and flush runs of Unicode escapes out once they end.
-        let mut codepoint_escapes: Vec<u16> = Vec::new();
-        let flush_escapes = |cps: &mut Vec<u16>, s: &mut String| -> Result<(), ParseError> {
-            let chars = char::decode_utf16(cps.iter().copied())
-                .map(|r| r.map_err(|e| e.unpaired_surrogate()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|s| ParseError::UnicodeError(UnicodeError::UnpairedUnicodeSurrogate(s)))?;
+        loop {
+            if let Some(high_surrogate) = self.pending_high_surrogate {
+                // A pending high surrogate is invalid without a subsequent low
+                // surrogate.
+                let (STRING_ESCAPE_OPEN, b'u') = (self.advance()?, self.advance()?) else {
+                    return Err(self.err(UnicodeError(
+                        error::UnicodeError::UnpairedHighSurrogate(high_surrogate.get()),
+                    )));
+                };
 
-            for c in chars {
+                let low_surrogate_candidate = self.collect_unicode_escape_hex_digits()?;
+                let mut chars = char::decode_utf16([high_surrogate.get(), low_surrogate_candidate]);
+                let c = chars
+                    .next()
+                    .expect("should have one (potentially error) element after providing surrogate pair candidate")
+                    .map_err(|e| self.err(UnicodeError(error::UnicodeError::InvalidUTF16(e))))?;
                 s.push(c);
+                assert!(
+                    chars.next().is_none(),
+                    "should not yield more than 1 character from 1 surrogate pair"
+                );
+
+                self.pending_high_surrogate = None;
             }
 
-            cps.clear();
-
-            Ok(())
-        };
-
-        loop {
             match self.advance()? {
-                STRING_QUOTE => {
-                    flush_escapes(&mut codepoint_escapes, &mut s)?;
-                    break Ok(s);
-                }
+                STRING_QUOTE => break Ok(s),
                 STRING_ESCAPE_OPEN => match self.advance()? {
-                    b'"' => {
-                        flush_escapes(&mut codepoint_escapes, &mut s)?;
-                        s.push('"');
-                    }
-                    b'\\' => {
-                        flush_escapes(&mut codepoint_escapes, &mut s)?;
-                        s.push('\\');
-                    }
-                    b'/' => {
-                        flush_escapes(&mut codepoint_escapes, &mut s)?;
-                        s.push('/');
-                    }
-                    b'b' => {
-                        flush_escapes(&mut codepoint_escapes, &mut s)?;
-                        s.push('\x08');
-                    }
-                    b'f' => {
-                        flush_escapes(&mut codepoint_escapes, &mut s)?;
-                        s.push('\x0C');
-                    }
-                    b'n' => {
-                        flush_escapes(&mut codepoint_escapes, &mut s)?;
-                        s.push('\n');
-                    }
-                    b'r' => {
-                        flush_escapes(&mut codepoint_escapes, &mut s)?;
-                        s.push('\r');
-                    }
-                    b't' => {
-                        flush_escapes(&mut codepoint_escapes, &mut s)?;
-                        s.push('\t');
-                    }
+                    b'"' => s.push('"'),
+                    b'\\' => s.push('\\'),
+                    b'/' => s.push('/'),
+                    b'b' => s.push('\x08'),
+                    b'f' => s.push('\x0C'),
+                    b'n' => s.push('\n'),
+                    b'r' => s.push('\r'),
+                    b't' => s.push('\t'),
                     b'u' => {
-                        let codepoint = self.collect_hex()?;
-                        codepoint_escapes.push(codepoint);
-                    }
-                    b => break Err(ParseError::InvalidEscapeSequence(b)),
-                },
-                byte @ 0..=127 => {
-                    flush_escapes(&mut codepoint_escapes, &mut s)?;
-                    s.push(byte as char); // ASCII: encoding == codepoint
-                }
-                byte => {
-                    flush_escapes(&mut codepoint_escapes, &mut s)?;
+                        let codepoint = self.collect_unicode_escape_hex_digits()?;
+                        assert!(
+                            self.pending_high_surrogate.is_none(),
+                            "should not reach consecutive (high) surrogates"
+                        );
 
-                    debug_assert!(
-                        0b1000_0000 & byte != 0,
-                        "MSB is zero, aka continuation bit exists"
-                    );
+                        match codepoint {
+                            // https://www.unicode.org/glossary/#high_surrogate_code_unit
+                            0xD800..=0xDBFF => {
+                                // Register it but do not push out yet. Need a low
+                                // surrogate partner, on next loop iteration.
+                                self.pending_high_surrogate =
+                                    Some(NonZero::new(codepoint).expect("should have value > 0 in this branch"));
+                            }
+                            // https://www.unicode.org/glossary/#low_surrogate_code_unit
+                            0xDC00..=0xDFFF => {
+                                return Err(self.err(UnicodeError(error::UnicodeError::UnpairedLowSurrogate(codepoint))))
+                            }
+                            val => s.push(char::from_u32(val as u32).expect("non-surrogate, u16 UTF-16 code point should always be a valid char")),
+                        }
+                    }
+                    b => break Err(self.err(InvalidEscapeSequence(b))),
+                },
+                byte @ 0..=127 => s.push(byte as char), // ASCII: encoding == codepoint
+                byte => {
+                    assert!(0b1000_0000 & byte != 0, "continuation bit is set");
                     let mut bytes = [0u8; 4];
                     bytes[0] = byte;
 
@@ -403,36 +369,40 @@ impl<R: Read> Parser<R> {
                     // below, but this way we only touch subsequent bytes if the start
                     // byte actually looks OK. The `str` will be stack-allocated, which
                     // is a neat bonus.
-                    if 0b0010_0000u8 & byte == 0 {
+                    let i = if 0b0010_0000u8 & byte == 0 {
                         bytes[1] = self.advance()?;
-                        s.push_str(str::from_utf8(&bytes[..2])?);
+                        2
                     } else if 0b0001_0000u8 & byte == 0 {
                         bytes[1] = self.advance()?;
                         bytes[2] = self.advance()?;
-                        s.push_str(str::from_utf8(&bytes[..3])?);
+                        3
                     } else if 0b0000_1000u8 & byte == 0 {
                         bytes[1] = self.advance()?;
                         bytes[2] = self.advance()?;
                         bytes[3] = self.advance()?;
-                        s.push_str(str::from_utf8(&bytes[..4])?);
+                        4
                     } else {
-                        break Err(ParseError::UnicodeError(UnicodeError::InvalidUTF8Start(
-                            byte,
-                        )));
-                    }
+                        return Err(
+                            self.err(UnicodeError(error::UnicodeError::InvalidUTF8Start(byte)))
+                        );
+                    };
+
+                    s.push_str(
+                        str::from_utf8(&bytes[..i]).map_err(|utf8err| self.err(utf8err.into()))?,
+                    );
                 }
             }
         }
     }
 
-    fn visit_array(&mut self) -> Result<Vec<Value>, ParseError> {
+    fn visit_array(&mut self) -> ParseResult<Vec<Value>> {
         {
             let byte = self.advance()?;
             if byte != ARRAY_OPEN {
-                return Err(ParseError::InvalidByte {
+                return Err(self.err(InvalidByte {
                     byte,
                     reason: format!("expected {} for start of array", ARRAY_OPEN as char),
-                });
+                }));
             };
         }
 
@@ -452,64 +422,64 @@ impl<R: Read> Parser<R> {
                 ARRAY_CLOSE => break Ok(array),
                 ARRAY_SEP => continue,
                 byte => {
-                    break Err(ParseError::InvalidByte {
+                    break Err(self.err(InvalidByte {
                         byte,
                         reason: format!(
                             "parsing array, need {} or {} after parsing an array element",
                             ARRAY_CLOSE as char, ARRAY_SEP as char,
                         ),
-                    });
+                    }));
                 }
             }
         }
     }
 
-    fn visit_bool(&mut self) -> Result<bool, ParseError> {
+    fn visit_bool(&mut self) -> ParseResult<bool> {
         let (expected_remainder, result) = match self.advance()? {
             b't' => (b"rue".as_slice(), true),
             b'f' => (b"alse".as_slice(), false),
             byte => {
-                return Err(ParseError::InvalidByte {
+                return Err(self.err(InvalidByte {
                     byte,
                     reason: "expected t or f looking for beginning of boolean value".into(),
-                });
+                }));
             }
         };
 
         for expected in expected_remainder.iter().copied() {
             let got = self.advance()?;
             if expected != got {
-                return Err(ParseError::InvalidByte {
+                return Err(self.err(InvalidByte {
                     byte: got,
                     reason: format!(
                         "expected {} scanning boolean value, got {}",
                         expected as char, got as char
                     ),
-                });
+                }));
             }
         }
 
         Ok(result)
     }
 
-    fn visit_null(&mut self) -> Result<(), ParseError> {
+    fn visit_null(&mut self) -> ParseResult<()> {
         for expected in b"null".iter().copied() {
             let got = self.advance()?;
             if expected != got {
-                return Err(ParseError::InvalidByte {
+                return Err(self.err(InvalidByte {
                     byte: got,
                     reason: format!(
                         "expected {} scanning for null, got {}",
                         expected as char, got as char
                     ),
-                });
+                }));
             }
         }
 
         Ok(())
     }
 
-    fn visit_number(&mut self) -> Result<Number, ParseError> {
+    fn visit_number(&mut self) -> ParseResult<Number> {
         let mut number = Number(String::with_capacity(1));
         number = self.visit_number_integral_part(number)?;
         number = self.visit_number_fractional_part(number)?;
@@ -519,12 +489,12 @@ impl<R: Read> Parser<R> {
             // If there's a digit left we might have gotten a leading zero followed by
             // more digits, e.g. `01`. Without fractional or exponent parts, our parsing
             // just exits after `0`, so check.
-            Some(Ok(byte @ b'0'..=b'9')) => Err(ParseError::InvalidByte {
-                byte: *byte,
+            Some(&Ok(byte @ b'0'..=b'9')) => Err(self.err(InvalidByte {
+                byte,
                 reason: format!(
                     "unexpected digit remaining after processing number ('{number:?}')"
                 ),
-            }),
+            })),
             _ => Ok(number),
         }
     }
@@ -536,7 +506,7 @@ impl<R: Read> Parser<R> {
     /// numbers do not. We need to be careful not to overfetch, thus work with peeking
     /// and more manual advancing. In general, for every `push` into the number, there
     /// needs to be an advance of the reader.
-    fn visit_number_integral_part(&mut self, mut number: Number) -> Result<Number, ParseError> {
+    fn visit_number_integral_part(&mut self, mut number: Number) -> ParseResult<Number> {
         // First token is mandatory, there's no way we can overfetch here: so consume
         // right away.
         match self.advance()? {
@@ -565,10 +535,10 @@ impl<R: Read> Parser<R> {
                             self.advance()?;
                         }
                     }
-                    byte => Err(ParseError::InvalidByte {
+                    byte => Err(self.err(InvalidByte {
                         byte,
                         reason: "expected digit after - sign scanning number".into(),
-                    }),
+                    })),
                 }
             }
             b'0' => {
@@ -589,14 +559,14 @@ impl<R: Read> Parser<R> {
                     self.advance()?;
                 }
             }
-            byte => Err(ParseError::InvalidByte {
+            byte => Err(self.err(InvalidByte {
                 byte,
                 reason: "expected digit or - scanning number".into(),
-            }),
+            })),
         }
     }
 
-    fn visit_number_fractional_part(&mut self, mut number: Number) -> Result<Number, ParseError> {
+    fn visit_number_fractional_part(&mut self, mut number: Number) -> ParseResult<Number> {
         match self.stream.peek() {
             Some(Ok(b'.')) => {
                 number.0.push('.');
@@ -616,7 +586,7 @@ impl<R: Read> Parser<R> {
         }
     }
 
-    fn visit_number_exponent_part(&mut self, mut number: Number) -> Result<Number, ParseError> {
+    fn visit_number_exponent_part(&mut self, mut number: Number) -> ParseResult<Number> {
         match self.stream.peek() {
             Some(Ok(b'e' | b'E')) => {
                 number.0.push('e'); // Case doesn't matter
@@ -634,19 +604,19 @@ impl<R: Read> Parser<R> {
                 match self.advance()? {
                     byte @ b'0'..=b'9' => number.0.push(byte as char),
                     byte => {
-                        return Err(ParseError::InvalidByte {
+                        return Err(self.err(InvalidByte {
                             byte,
                             reason: "expected digit after sign scanning number exponent".into(),
-                        });
+                        }));
                     }
                 }
             }
             byte @ b'0'..=b'9' => number.0.push(byte as char),
             byte => {
-                return Err(ParseError::InvalidByte {
+                return Err(self.err(InvalidByte {
                     byte,
                     reason: "expected digit or sign scanning number exponent".into(),
-                });
+                }));
             }
         }
 
@@ -662,20 +632,37 @@ impl<R: Read> Parser<R> {
         }
     }
 
-    /// Collect exactly 4 hex digits from a JSON escape sequence (which is required to
-    /// be exactly 4 long).
-    fn collect_hex(&mut self) -> Result<u16, ParseError> {
-        let mut val = 0u16;
+    /// JSON Unicode hex escapes are **required** to be 4 long.
+    fn collect_unicode_escape_hex_digits(&mut self) -> ParseResult<u16> {
+        self.collect_hex::<u16, 4>()
+    }
 
-        for _ in 0..4 {
-            // Casting works because all hex digits are ASCII, where UTF8 encoding
-            // corresponds to Unicode code points directly.
+    /// Collect hex digits.
+    ///
+    /// `T` is the target type to collect into. `N` is the number of hex chars/digits to
+    /// collect. Note they're indepedent: few digits can be collected into a large `T`
+    /// etc.
+    fn collect_hex<T, const N: usize>(&mut self) -> ParseResult<T>
+    where
+        // Generic over u8, u16, ...
+        T: Default
+            + Copy
+            + From<u8>
+            + std::ops::Shl<usize, Output = T>
+            + std::ops::BitOr<Output = T>,
+    {
+        let mut val = T::default();
+
+        for _ in 0..N {
             let c = self.advance()? as char;
 
-            // If it wasn't a hex but something malformed, it's caught here.
-            let digit = c.to_digit(16).ok_or(ParseError::InvalidHexCharacter(c))?;
+            let digit = c
+                .to_digit(16)
+                .ok_or_else(|| self.err(InvalidHexCharacter(c)))?;
 
-            val = (val << 4) | (digit as u16);
+            // Cast digit to u8. That's safe because `to_digit(16)` guarantees
+            // values 0-15. That allows us to use `From<u8>`
+            val = (val << 4) | T::from(digit as u8);
         }
 
         Ok(val)
@@ -704,8 +691,8 @@ mod tests {
     }
 
     /// Helper to expect a specific error type.
-    fn parse_err(input: &str) -> ParseError {
-        let mut parser = Parser::new(input.as_bytes());
+    fn parse_err(input: &[u8]) -> error::Error {
+        let mut parser = Parser::new(input);
         parser.parse().expect_err("Expected error but got success")
     }
 
@@ -798,6 +785,81 @@ mod tests {
     }
 
     #[test]
+    fn test_utf8_invalid_start_byte_in_string() {
+        let input = b"\"\xFF\"";
+
+        let err = parse_err(input);
+        match err {
+            error::Error {
+                kind: UnicodeError(error::UnicodeError::InvalidUTF8Start(0xFF)),
+                ..
+            } => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_utf8_invalid_continuation_byte_in_string() {
+        // 0xC3 starts a 2-byte sequence (expects 1 continuation), but followed by space.
+        let input = b"\"\xC3 \"";
+
+        let err = parse_err(input);
+        match err {
+            error::Error {
+                kind: UnicodeError(error::UnicodeError::InvalidUTF8(_)),
+                ..
+            } => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_utf8_invalid_start_byte_inside_string() {
+        // 0xE2 starts a 3-byte sequence, 0x82 is a valid continuation, but 0xC0 is a
+        // START byte (for 2-byte seq), not a continuation
+        let input = b"\"\xE2\x82\xC0 \"";
+
+        let err = parse_err(input);
+        match err {
+            error::Error {
+                kind: UnicodeError(error::UnicodeError::InvalidUTF8(_)),
+                ..
+            } => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_utf8_deny_overlong_encoding() {
+        // More bytes than necessary should be rejected
+        let input = b"\"\xC0\xAF \"";
+
+        let err = parse_err(input);
+        match err {
+            error::Error {
+                kind: UnicodeError(error::UnicodeError::InvalidUTF8(_)),
+                ..
+            } => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_utf8_premature_end_in_string() {
+        // Starts 4-byte sequence but ends right away
+        let input = b"\"\xF0\"";
+
+        let err = parse_err(input);
+        match err {
+            error::Error {
+                kind: UnexpectedEOF,
+                ..
+            } => {}
+            _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
     fn test_surrogate_pairs() {
         // G-Clef (U+1D11E) represented as surrogate pair \uD834\uDD1E
         assert_eq!(parse_string(r#""\ud834\udd1e""#), "𝄞");
@@ -833,10 +895,12 @@ mod tests {
 
     #[test]
     fn test_err_unexpected_eof_no_end_quote() {
-        let err = parse_err("\"unclosed");
-        // Depending on implementation, might trigger IO error or UnexpectedEOF
+        let err = parse_err(b"\"unclosed");
         match err {
-            ParseError::UnexpectedEOF | ParseError::Io(_) => {}
+            error::Error {
+                kind: UnexpectedEOF,
+                ..
+            } => {}
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
@@ -844,9 +908,12 @@ mod tests {
     #[test]
     fn test_err_invalid_escape_char() {
         // \a is not a valid JSON escape
-        let err = parse_err(r#""\a""#);
+        let err = parse_err(br#""\a""#);
         match err {
-            ParseError::InvalidEscapeSequence(b) => assert_eq!(b, b'a'),
+            error::Error {
+                kind: InvalidEscapeSequence(b),
+                ..
+            } => assert_eq!(b, b'a'),
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
@@ -854,9 +921,12 @@ mod tests {
     #[test]
     fn test_err_invalid_hex_digit() {
         // 'z' is not hex
-        let err = parse_err(r#""\u123z""#);
+        let err = parse_err(br#""\u123z""#);
         match err {
-            ParseError::InvalidHexCharacter(c) => assert_eq!(c, 'z'),
+            error::Error {
+                kind: InvalidHexCharacter(c),
+                ..
+            } => assert_eq!(c, 'z'),
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
@@ -864,10 +934,12 @@ mod tests {
     #[test]
     fn test_err_invalid_hex_length() {
         // Ends prematurely
-        let err = parse_err(r#""\u12""#);
+        let err = parse_err(br#""\u12""#);
         match err {
-            // It hits the quote '"' while expecting a hex digit
-            ParseError::InvalidHexCharacter(c) => assert_eq!(c, '"'),
+            error::Error {
+                kind: InvalidHexCharacter(c),
+                ..
+            } => assert_eq!(c, '"'),
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
@@ -875,12 +947,75 @@ mod tests {
     #[test]
     fn test_err_unpaired_surrogate() {
         // High surrogate \uD800 without a following Low surrogate
-        let err = parse_err(r#""\ud800""#);
+        let err = parse_err(br#""\ud800""#);
         match err {
-            ParseError::UnicodeError(UnicodeError::UnpairedUnicodeSurrogate(u)) => {
-                assert_eq!(u, 0xd800);
-            }
+            error::Error {
+                kind: UnexpectedEOF,
+                ..
+            } => {}
             _ => panic!("Wrong error type: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_high_surrogate_followed_by_literal() {
+        let err = parse_err(br#""\ud800a""#);
+        match err {
+            error::Error {
+                kind: UnicodeError(error::UnicodeError::UnpairedHighSurrogate(0xD800)),
+                ..
+            } => {}
+            _ => panic!("Expected UnpairedUnicodeSurrogate, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_high_surrogate_followed_by_wrong_escape() {
+        let err = parse_err(br#""\ud800\n""#);
+        match err {
+            error::Error {
+                kind: UnicodeError(error::UnicodeError::UnpairedHighSurrogate(0xD800)),
+                ..
+            } => {}
+            _ => panic!("Expected UnpairedUnicodeSurrogate, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_double_high_surrogate() {
+        // Need pairs of (high, low), (high, high) is invalid
+        let err = parse_err(br#""\ud800\ud800""#);
+        match err {
+            error::Error {
+                kind: UnicodeError(error::UnicodeError::InvalidUTF16(_)),
+                ..
+            } => {}
+            _ => panic!("Expected InvalidUTF16 error, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_high_surrogate_followed_by_invalid_utf16() {
+        // Escape is valid code point, but it's not in the low surrogate rang
+        let err = parse_err(br#""\ud800\u1234""#);
+        match err {
+            error::Error {
+                kind: UnicodeError(error::UnicodeError::InvalidUTF16(_)),
+                ..
+            } => {}
+            _ => panic!("Expected InvalidUTF16 error, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_err_orphaned_low_surrogate() {
+        let err = parse_err(br#""\udd1e""#);
+        match err {
+            error::Error {
+                kind: UnicodeError(error::UnicodeError::UnpairedLowSurrogate(0xDD1E)),
+                ..
+            } => {}
+            _ => panic!("Expected UnicodeError, got {:?}", err),
         }
     }
 
@@ -996,27 +1131,36 @@ mod tests {
     #[test]
     fn test_err_object_trailing_comma() {
         // Trailing commas are not allowed in standard JSON
-        let err = parse_err(r#"{"a": "b",}"#);
+        let err = parse_err(br#"{"a": "b",}"#);
         match err {
-            ParseError::InvalidByte { byte: b'}', .. } | ParseError::UnexpectedEOF => {}
+            error::Error {
+                kind: InvalidByte { byte: b'}', .. },
+                ..
+            } => {}
             _ => panic!("Expected InvalidByte or EOF, got {:?}", err),
         }
     }
 
     #[test]
     fn test_err_object_missing_colon() {
-        let err = parse_err(r#"{"key" "value"}"#);
+        let err = parse_err(br#"{"key" "value"}"#);
         match err {
-            ParseError::InvalidByte { byte: b'"', .. } => {}
+            error::Error {
+                kind: InvalidByte { byte: b'"', .. },
+                ..
+            } => {}
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
 
     #[test]
     fn test_err_object_missing_comma() {
-        let err = parse_err(r#"{"a": "b" "c": "d"}"#);
+        let err = parse_err(br#"{"a": "b" "c": "d"}"#);
         match err {
-            ParseError::InvalidByte { byte: b'"', .. } => {}
+            error::Error {
+                kind: InvalidByte { byte: b'"', .. },
+                ..
+            } => {}
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
@@ -1024,9 +1168,12 @@ mod tests {
     #[test]
     fn test_err_object_key_must_be_string() {
         // Keys must be strings.
-        let err = parse_err(r#"{ 1: "b" }"#);
+        let err = parse_err(br#"{ 1: "b" }"#);
         match err {
-            ParseError::InvalidByte { byte: b'1', .. } => {}
+            error::Error {
+                kind: InvalidByte { byte: b'1', .. },
+                ..
+            } => {}
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
@@ -1162,9 +1309,12 @@ mod tests {
 
     #[test]
     fn test_err_array_missing_comma() {
-        let err = parse_err(r#"[ "a" "b" ]"#);
+        let err = parse_err(br#"[ "a" "b" ]"#);
         match err {
-            ParseError::InvalidByte { byte: b'"', reason } => {
+            error::Error {
+                kind: InvalidByte { byte: b'"', reason },
+                ..
+            } => {
                 assert!(reason.contains("need ] or ,"));
             }
             _ => panic!("Wrong error type: {:?}", err),
@@ -1173,18 +1323,24 @@ mod tests {
 
     #[test]
     fn test_err_array_unclosed() {
-        let err = parse_err(r#"[ "open" "#);
+        let err = parse_err(br#"[ "open" "#);
         match err {
-            ParseError::UnexpectedEOF => {}
+            error::Error {
+                kind: UnexpectedEOF,
+                ..
+            } => {}
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
 
     #[test]
     fn test_err_array_trailing_comma() {
-        let err = parse_err(r#"[ "a", ]"#);
+        let err = parse_err(br#"[ "a", ]"#);
         match err {
-            ParseError::InvalidByte { byte: b']', reason } => {
+            error::Error {
+                kind: InvalidByte { byte: b']', reason },
+                ..
+            } => {
                 assert!(reason.contains("looking for beginning of value"));
             }
             _ => panic!("Wrong error type: {:?}", err),
@@ -1284,9 +1440,12 @@ mod tests {
 
     #[test]
     fn test_err_bool_typo_true() {
-        let err = parse_err("trus");
+        let err = parse_err(b"trus");
         match err {
-            ParseError::InvalidByte { byte: b's', reason } => {
+            error::Error {
+                kind: InvalidByte { byte: b's', reason },
+                ..
+            } => {
                 assert!(reason.contains("expected e"));
                 assert!(reason.contains("scanning boolean"));
             }
@@ -1296,9 +1455,12 @@ mod tests {
 
     #[test]
     fn test_err_bool_typo_false() {
-        let err = parse_err("falze");
+        let err = parse_err(b"falze");
         match err {
-            ParseError::InvalidByte { byte: b'z', reason } => {
+            error::Error {
+                kind: InvalidByte { byte: b'z', reason },
+                ..
+            } => {
                 assert!(reason.contains("expected s"));
             }
             _ => panic!("Wrong error type: {:?}", err),
@@ -1307,18 +1469,24 @@ mod tests {
 
     #[test]
     fn test_err_bool_incomplete() {
-        let err = parse_err("fal");
+        let err = parse_err(b"fal");
         match err {
-            ParseError::UnexpectedEOF => {}
+            error::Error {
+                kind: UnexpectedEOF,
+                ..
+            } => {}
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
 
     #[test]
     fn test_err_bool_case_sensitive() {
-        let err = parse_err("True");
+        let err = parse_err(b"True");
         match err {
-            ParseError::InvalidByte { byte: b'T', reason } => {
+            error::Error {
+                kind: InvalidByte { byte: b'T', reason },
+                ..
+            } => {
                 assert!(reason.contains("looking for beginning of value"));
             }
             _ => panic!("Wrong error type: {:?}", err),
@@ -1414,36 +1582,48 @@ mod tests {
 
     #[test]
     fn test_err_null_typo() {
-        let err = parse_err("nil");
+        let err = parse_err(b"nil");
         match err {
-            ParseError::InvalidByte { byte: b'i', .. } => {}
+            error::Error {
+                kind: InvalidByte { byte: b'i', .. },
+                ..
+            } => {}
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
 
     #[test]
     fn test_err_null_typo_end() {
-        let err = parse_err("nulL");
+        let err = parse_err(b"nulL");
         match err {
-            ParseError::InvalidByte { byte: b'L', .. } => {}
+            error::Error {
+                kind: InvalidByte { byte: b'L', .. },
+                ..
+            } => {}
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
 
     #[test]
     fn test_err_null_incomplete() {
-        let err = parse_err("nu");
+        let err = parse_err(b"nu");
         match err {
-            ParseError::UnexpectedEOF => {}
+            error::Error {
+                kind: UnexpectedEOF,
+                ..
+            } => {}
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
 
     #[test]
     fn test_err_null_case_sensitive() {
-        let err = parse_err("Null");
+        let err = parse_err(b"Null");
         match err {
-            ParseError::InvalidByte { byte: b'N', reason } => {
+            error::Error {
+                kind: InvalidByte { byte: b'N', reason },
+                ..
+            } => {
                 assert!(reason.contains("looking for beginning of value"));
             }
             _ => panic!("Wrong error type: {:?}", err),
@@ -1596,9 +1776,12 @@ mod tests {
 
     #[test]
     fn test_err_number_leading_zero() {
-        let err = parse_err("01");
+        let err = parse_err(b"01");
         match err {
-            ParseError::InvalidByte { byte: b'1', .. } => {}
+            error::Error {
+                kind: InvalidByte { byte: b'1', .. },
+                ..
+            } => {}
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
@@ -1606,27 +1789,36 @@ mod tests {
     #[test]
     fn test_err_number_incomplete_exponent() {
         // "1e" is invalid. Must have digits.
-        let err = parse_err("1e");
+        let err = parse_err(b"1e");
         match err {
-            ParseError::UnexpectedEOF => {}
+            error::Error {
+                kind: UnexpectedEOF,
+                ..
+            } => {}
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
 
     #[test]
     fn test_err_number_exponent_sign_no_digits() {
-        let err = parse_err("1e+");
+        let err = parse_err(b"1e+");
         match err {
-            ParseError::UnexpectedEOF => {}
+            error::Error {
+                kind: UnexpectedEOF,
+                ..
+            } => {}
             _ => panic!("Wrong error type: {:?}", err),
         }
     }
 
     #[test]
     fn test_err_number_double_negative() {
-        let err = parse_err("--1");
+        let err = parse_err(b"--1");
         match err {
-            ParseError::InvalidByte { byte: b'-', reason } => {
+            error::Error {
+                kind: InvalidByte { byte: b'-', reason },
+                ..
+            } => {
                 assert!(reason.contains("expected digit"));
             }
             _ => panic!("Wrong error type: {:?}", err),

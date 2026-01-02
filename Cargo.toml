@@ -12,3 +12,6 @@ serde = { path = "serde" }
 kv = { path = "kv" }
 util = { path = "util" }
 json = { path = "json" }
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
