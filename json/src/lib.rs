@@ -129,6 +129,7 @@ impl TryFrom<&Number> for f64 {
 /// A fully-featured, streaming JSON parser.
 ///
 /// Spec: <https://www.json.org/json-en.html>
+#[derive(Debug)]
 pub struct Parser<R: Read> {
     stream: Peekable<Bytes<BufReader<R>>>,
     /// Bytes read from stream so far.
@@ -388,7 +389,8 @@ impl<R: Read> Parser<R> {
                     };
 
                     s.push_str(
-                        str::from_utf8(&bytes[..i]).map_err(|utf8err| self.err(utf8err.into()))?,
+                        str::from_utf8(bytes.get(..i).expect("should set indices correctly"))
+                            .map_err(|utf8err| self.err(utf8err.into()))?,
                     );
                 }
             }
@@ -660,9 +662,13 @@ impl<R: Read> Parser<R> {
                 .to_digit(16)
                 .ok_or_else(|| self.err(InvalidHexCharacter(c)))?;
 
-            // Cast digit to u8. That's safe because `to_digit(16)` guarantees
-            // values 0-15. That allows us to use `From<u8>`
-            val = (val << 4) | T::from(digit as u8);
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "to_digit(16) guarantees values 0-15, which fit u8"
+            )]
+            {
+                val = (val << 4) | T::from(digit as u8); // works thanks to `From<u8>`
+            }
         }
 
         Ok(val)
