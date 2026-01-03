@@ -51,28 +51,133 @@ impl Display for DeserializeError {
 
 impl Error for DeserializeError {}
 
-/// Blanket impl for any type of which we can build a [`Value`] from just a reference.
-impl<T> Serialize for T
-where
-    for<'a> Value: From<&'a T>, // for any lifetime, doesn't matter
-{
-    fn serialize(&self) -> Result<Value, SerializeError> {
-        let v: Value = self.into();
-        Ok(v)
-    }
-}
+/// Implementations for common and more complex types. Generally, implementing [`From`]
+/// and/or [`TryFrom`] etc. on generic stdlib types is error-prone as it can lead to
+/// infinite recursion. Being explicit with our own traits is much simpler and safer.
+pub mod stddlib_impls {
+    use crate::{
+        Value,
+        serde::{DeserializeError, SerializeError},
+    };
 
-/// Blanket impl to deserialize any type which has a [`TryFrom`], where its associated
-/// error can be converted.
-impl<T> Deserialize for T
-where
-    T: TryFrom<Value>,
-    <T as TryFrom<Value>>::Error: Into<DeserializeError>,
-{
-    fn deserialize(value: Value) -> Result<Self, DeserializeError>
+    use super::{Deserialize, Serialize};
+
+    // Primitives, non-generic
+
+    impl Serialize for () {
+        fn serialize(&self) -> Result<Value, SerializeError> {
+            Ok(Value::Null)
+        }
+    }
+
+    impl Serialize for String {
+        fn serialize(&self) -> Result<Value, SerializeError> {
+            Ok(self.as_str().into())
+        }
+    }
+
+    impl Deserialize for String {
+        fn deserialize(value: Value) -> Result<Self, super::DeserializeError> {
+            let v = value.try_into()?;
+            Ok(v)
+        }
+    }
+
+    impl Serialize for u64 {
+        fn serialize(&self) -> Result<Value, SerializeError> {
+            Ok((*self).into())
+        }
+    }
+
+    impl Deserialize for u64 {
+        fn deserialize(value: Value) -> Result<Self, super::DeserializeError> {
+            let v = value.try_into()?;
+            Ok(v)
+        }
+    }
+
+    impl Serialize for i64 {
+        fn serialize(&self) -> Result<Value, SerializeError> {
+            Ok((*self).into())
+        }
+    }
+
+    impl Deserialize for i64 {
+        fn deserialize(value: Value) -> Result<Self, super::DeserializeError> {
+            let v = value.try_into()?;
+            Ok(v)
+        }
+    }
+
+    // Generics
+
+    impl<T> Serialize for &T
     where
-        Self: Sized,
+        T: Serialize,
     {
-        value.try_into().map_err(Into::into)
+        fn serialize(&self) -> Result<Value, SerializeError> {
+            // This is OK because `serialize` only needs a ref; we don't actually move
+            // out here.
+            (*self).serialize()
+        }
+    }
+
+    impl<T> Serialize for [T]
+    where
+        T: Serialize,
+    {
+        fn serialize(&self) -> Result<Value, SerializeError> {
+            let items: Result<Vec<Value>, _> = self.iter().map(|t| t.serialize()).collect();
+            Ok(Value::Array(items?))
+        }
+    }
+
+    impl<T> Serialize for Vec<T>
+    where
+        T: Serialize,
+    {
+        fn serialize(&self) -> Result<Value, SerializeError> {
+            self.as_slice().serialize()
+        }
+    }
+
+    impl<T> Deserialize for Vec<T>
+    where
+        T: Deserialize,
+    {
+        fn deserialize(value: Value) -> Result<Self, super::DeserializeError> {
+            if let Value::Array(values) = value {
+                let items: Result<Self, _> =
+                    values.into_iter().map(|v| T::deserialize(v)).collect();
+                Ok(items?)
+            } else {
+                Err(DeserializeError::InvalidValue(value))
+            }
+        }
+    }
+
+    impl<T> Serialize for Option<T>
+    where
+        T: Serialize,
+    {
+        fn serialize(&self) -> Result<Value, SerializeError> {
+            match self {
+                Some(v) => T::serialize(v),
+                None => Ok(Value::Null),
+            }
+        }
+    }
+
+    impl<T> Deserialize for Option<T>
+    where
+        T: Deserialize,
+    {
+        fn deserialize(value: Value) -> Result<Self, super::DeserializeError> {
+            if let Value::Null = value {
+                Ok(None)
+            } else {
+                Ok(Some(T::deserialize(value)?))
+            }
+        }
     }
 }

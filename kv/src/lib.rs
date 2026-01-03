@@ -1,6 +1,51 @@
-use std::{collections::HashMap, fmt::Debug};
+use std::{collections::HashMap, fmt::Debug, hash::Hash};
 
 use json::{Value as JSONValue, conversions::from_value::TryFromError};
+
+/// Infrastructure kerfuffle (not domain-specific).
+pub mod infra;
+
+#[derive(Debug)]
+pub struct Store<K: Hash + Eq, V: PartialEq> {
+    inner: HashMap<K, V>,
+}
+
+#[derive(Debug)]
+pub enum CASError<'v, V> {
+    NoSuchKey,
+    ValueMismatch { requested: V, found: &'v V },
+}
+
+impl<K: Hash + Eq, V: PartialEq> Store<K, V> {
+    #[expect(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self {
+            inner: HashMap::new(),
+        }
+    }
+
+    pub fn read(&self, key: &K) -> Option<&V> {
+        self.inner.get(key)
+    }
+
+    pub fn write(&mut self, key: K, value: V) {
+        self.inner.insert(key, value);
+    }
+
+    pub fn compare_and_swap(&mut self, key: &K, from: V, to: V) -> Result<(), CASError<'_, V>> {
+        match self.inner.get_mut(key) {
+            Some(v) if *v == from => {
+                *v = to;
+                Ok(())
+            }
+            Some(v) => Err(CASError::ValueMismatch {
+                requested: from,
+                found: v,
+            }),
+            None => Err(CASError::NoSuchKey),
+        }
+    }
+}
 
 pub struct Put {
     pub key: Vec<u8>,

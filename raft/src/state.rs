@@ -3,21 +3,22 @@ use std::{
     fmt::{self, Display},
 };
 
-use json::{Value as JSONValue, conversions::from_value::TryFromError};
+use json::{
+    Value as JSONValue,
+    serde::{Deserialize, Serialize},
+};
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Candidate(pub u64);
 
-impl From<&Candidate> for JSONValue {
-    fn from(value: &Candidate) -> Self {
-        value.0.into()
+impl Serialize for Candidate {
+    fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
+        Ok(self.0.into())
     }
 }
 
-impl TryFrom<JSONValue> for Candidate {
-    type Error = TryFromError;
-
-    fn try_from(value: JSONValue) -> Result<Self, Self::Error> {
+impl Deserialize for Candidate {
+    fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
         let v: u64 = value.try_into()?;
         Ok(Self(v))
     }
@@ -32,16 +33,14 @@ impl Display for Candidate {
 #[derive(Debug, Default, PartialEq)]
 pub struct Term(pub u64);
 
-impl From<&Term> for JSONValue {
-    fn from(value: &Term) -> Self {
-        value.0.into()
+impl Serialize for Term {
+    fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
+        Ok(self.0.into())
     }
 }
 
-impl TryFrom<JSONValue> for Term {
-    type Error = TryFromError;
-
-    fn try_from(value: JSONValue) -> Result<Self, Self::Error> {
+impl Deserialize for Term {
+    fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
         let v: u64 = value.try_into()?;
         Ok(Self(v))
     }
@@ -59,38 +58,35 @@ pub struct LogEntry<C> {
     pub term: Term,
 }
 
-impl<C> From<&LogEntry<C>> for JSONValue
+impl<C> Serialize for LogEntry<C>
 where
-    for<'a> JSONValue: From<&'a C>,
+    C: Serialize,
 {
-    fn from(value: &LogEntry<C>) -> Self {
-        Self::Object(HashMap::from([
-            ("cmd".to_string(), (&value.cmd).into()),
-            ("term".to_string(), (&value.term).into()),
-        ]))
+    fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
+        Ok(JSONValue::Object(HashMap::from([
+            ("cmd".to_string(), self.cmd.serialize()?),
+            ("term".to_string(), self.term.serialize()?),
+        ])))
     }
 }
 
-impl<C: TryFrom<JSONValue, Error = TryFromError>> TryFrom<JSONValue> for LogEntry<C> {
-    type Error = TryFromError;
-
-    fn try_from(value: JSONValue) -> Result<Self, Self::Error> {
+impl<C> Deserialize for LogEntry<C>
+where
+    C: Deserialize,
+{
+    fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
         if let JSONValue::Object(mut map) = value {
             match (map.remove("cmd"), map.remove("term")) {
                 (Some(cmd), Some(term)) => Ok(Self {
-                    cmd: cmd.try_into()?,
-                    term: term.try_into()?,
+                    cmd: Deserialize::deserialize(cmd)?,
+                    term: Deserialize::deserialize(term)?,
                 }),
-                _ => Err(TryFromError {
-                    value: JSONValue::Object(map),
-                    reason: None,
-                }),
+                _ => Err(json::serde::DeserializeError::InvalidValue(
+                    JSONValue::Object(map),
+                )),
             }
         } else {
-            Err(TryFromError {
-                value,
-                reason: None,
-            })
+            Err(json::serde::DeserializeError::InvalidValue(value))
         }
     }
 }
@@ -121,23 +117,24 @@ impl<C: Display> Display for Persistent<C> {
     }
 }
 
-impl<C> From<&Persistent<C>> for JSONValue
+impl<C> Serialize for Persistent<C>
 where
-    for<'a> JSONValue: From<&'a C>,
+    C: Serialize,
 {
-    fn from(value: &Persistent<C>) -> Self {
-        Self::Object(HashMap::from([
-            ("current_term".to_string(), (&value.current_term).into()),
-            ("voted_for".to_string(), (&value.voted_for).into()),
-            ("log".to_string(), value.log.as_slice().into()),
-        ]))
+    fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
+        Ok(JSONValue::Object(HashMap::from([
+            ("current_term".to_string(), self.current_term.serialize()?),
+            ("voted_for".to_string(), self.voted_for.serialize()?),
+            ("log".to_string(), self.log.serialize()?),
+        ])))
     }
 }
 
-impl<C: TryFrom<JSONValue, Error = TryFromError>> TryFrom<JSONValue> for Persistent<C> {
-    type Error = TryFromError;
-
-    fn try_from(value: JSONValue) -> Result<Self, Self::Error> {
+impl<C> Deserialize for Persistent<C>
+where
+    C: Deserialize,
+{
+    fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
         if let JSONValue::Object(mut map) = value {
             match (
                 map.remove("current_term"),
@@ -145,20 +142,16 @@ impl<C: TryFrom<JSONValue, Error = TryFromError>> TryFrom<JSONValue> for Persist
                 map.remove("log"),
             ) {
                 (Some(current_term), Some(voted_for), Some(log)) => Ok(Self {
-                    current_term: current_term.try_into()?,
-                    voted_for: voted_for.try_into()?,
-                    log: log.try_into()?,
+                    current_term: Deserialize::deserialize(current_term)?,
+                    voted_for: Deserialize::deserialize(voted_for)?,
+                    log: Deserialize::deserialize(log)?,
                 }),
-                _ => Err(TryFromError {
-                    value: JSONValue::Object(map),
-                    reason: None,
-                }),
+                _ => Err(json::serde::DeserializeError::InvalidValue(
+                    JSONValue::Object(map),
+                )),
             }
         } else {
-            Err(TryFromError {
-                value,
-                reason: None,
-            })
+            Err(json::serde::DeserializeError::InvalidValue(value))
         }
     }
 }
@@ -195,32 +188,21 @@ pub enum State<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use json::{
-        Value as JSONValue,
-        serde::{Deserialize, Serialize},
-    };
+    use json::Value as JSONValue;
 
     #[derive(Debug, PartialEq)]
     struct TestCommand(String);
 
-    impl From<&TestCommand> for JSONValue {
-        fn from(value: &TestCommand) -> Self {
-            value.0.clone().into()
+    impl Serialize for TestCommand {
+        fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
+            self.0.serialize()
         }
     }
 
-    impl TryFrom<JSONValue> for TestCommand {
-        type Error = TryFromError;
-
-        fn try_from(value: JSONValue) -> Result<Self, Self::Error> {
-            if let JSONValue::String(s) = value {
-                Ok(Self(s))
-            } else {
-                Err(TryFromError {
-                    value,
-                    reason: None,
-                })
-            }
+    impl Deserialize for TestCommand {
+        fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
+            let s: String = value.try_into()?;
+            Ok(Self(s))
         }
     }
 

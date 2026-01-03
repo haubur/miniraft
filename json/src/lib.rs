@@ -81,6 +81,8 @@ impl Display for Value {
                 // Assumption: echoing number back verbatim is OK because it can only be
                 // constructed from parsing incoming JSON, at which point it is
                 // validated and rejected if invalid.
+                //
+                // This enables lossless round-tripping.
                 write!(f, "{}", num.0)
             }
             Value::Object(obj) => {
@@ -122,9 +124,13 @@ impl Display for Value {
 ///
 /// In the JSON spec, numbers have infinite precision. While often limited to [`f64`] in
 /// real-world implementations, this type helps retain original, unlimited JSON
-/// precision. Parsing simply normalizes the contained [`String`] to correspond to JSON
-/// rules, such that all valid instances are valid JSON. Converting to native numeric
-/// types is then up to consumers. Some common conversions are provided.
+/// precision.
+///
+/// **Assumption**: [`Parser::parse`] normalized the contained [`String`] to correspond
+/// to JSON rules, such that all valid instances are valid JSON (no other constructor).
+///
+/// Converting to native numeric types is up to consumers. Some common conversions are
+/// provided.
 #[derive(Debug)]
 pub struct Number(String);
 
@@ -196,27 +202,6 @@ pub mod conversions {
         impl From<f64> for Value {
             fn from(value: f64) -> Self {
                 Value::Number(Number(value.to_string()))
-            }
-        }
-
-        impl<T> From<&[T]> for Value
-        where
-            for<'a> Value: From<&'a T>,
-        {
-            fn from(value: &[T]) -> Self {
-                Value::Array(value.iter().map(Into::into).collect())
-            }
-        }
-
-        impl<T> From<&Option<T>> for Value
-        where
-            for<'a> Value: From<&'a T>,
-        {
-            fn from(value: &Option<T>) -> Self {
-                match value {
-                    Some(v) => v.into(),
-                    None => Value::Null,
-                }
             }
         }
 
@@ -305,6 +290,25 @@ pub mod conversions {
             }
         }
 
+        impl TryFrom<Value> for i64 {
+            type Error = TryFromError;
+
+            fn try_from(value: Value) -> Result<Self, Self::Error> {
+                if let Value::Number(ref num) = value {
+                    num.try_into()
+                        .map_err(|e: std::num::ParseIntError| TryFromError {
+                            value,
+                            reason: Some(e.into()),
+                        })
+                } else {
+                    Err(TryFromError {
+                        value,
+                        reason: None,
+                    })
+                }
+            }
+        }
+
         impl TryFrom<Value> for f64 {
             type Error = TryFromError;
 
@@ -319,44 +323,6 @@ pub mod conversions {
                         value,
                         reason: None,
                     })
-                }
-            }
-        }
-
-        impl<T> TryFrom<Value> for Vec<T>
-        where
-            T: TryFrom<Value, Error = TryFromError>,
-        {
-            type Error = TryFromError;
-
-            fn try_from(value: Value) -> Result<Self, Self::Error> {
-                if let Value::Array(values) = value {
-                    let mut items = Vec::with_capacity(values.len());
-                    for v in values {
-                        let item: T = v.try_into()?;
-                        items.push(item);
-                    }
-
-                    Ok(items)
-                } else {
-                    Err(TryFromError {
-                        value,
-                        reason: None,
-                    })
-                }
-            }
-        }
-
-        impl<T> TryFrom<Value> for Option<T>
-        where
-            T: TryFrom<Value, Error = TryFromError>,
-        {
-            type Error = TryFromError;
-
-            fn try_from(value: Value) -> Result<Self, Self::Error> {
-                match value {
-                    Value::Null => Ok(None),
-                    v => Ok(Some(v.try_into()?)),
                 }
             }
         }

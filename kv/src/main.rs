@@ -1,49 +1,73 @@
-use std::{io::stdin, thread};
+use std::{
+    sync::{Arc, Mutex},
+    thread,
+};
 
-use json::serde::{Deserialize, Serialize};
-use maelstrom::rpc::{MessageEnvelope, Request, Response};
+use kv::{
+    Store,
+    infra::{process, read, respond},
+};
+use maelstrom::{
+    NodeMessageIdGenerator,
+    rpc::{Message, Request, Response},
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut s = String::with_capacity(128);
-    stdin().read_line(&mut s)?;
-    eprintln!("received initial msg: {:?}", s);
-    let req = MessageEnvelope::deserialize(json::parse(s.as_bytes())?)?;
-    eprintln!("received initial request: {:?}", req);
+    // Global and stable across a node lifecycle
+    let mut node_id = None;
 
-    #[expect(irrefutable_let_patterns)]
-    let MessageEnvelope {
-        source,
-        body: Request::Init {
-            message_id,
-            node_id,
-            ..
-        },
-        destination: _,
-    } = req
-    else {
-        return Err("invalid initial request".into());
-    };
+    // Got K, V types from testing
+    let store = Arc::new(Mutex::new(Store::<u64, i64>::new()));
 
-    println!(
-        "{}",
-        MessageEnvelope {
-            source: node_id,
-            destination: source,
-            body: Response::InitOk {
-                in_reply_to: message_id
-            }
-        }
-        .serialize()?
-    );
+    // Try and fit into a cache line (best effort)
+    let mut buf = String::with_capacity(64);
 
     loop {
-        let mut s = String::with_capacity(128);
-        stdin().read_line(&mut s)?;
-        eprintln!("got request: {}", s.escape_debug());
+        let m = read(&mut buf)?;
 
-        thread::spawn(move || {
-            let msg = json::parse(s.as_bytes()).expect("can parse all JSON messages");
-            eprintln!("processing: {:?}", msg);
+        if node_id.is_none() {
+            let Message {
+                source,
+                body:
+                    Request::Init {
+                        message_id,
+                        node_id: init_node_id,
+                        ..
+                    },
+                ..
+            } = m
+            else {
+                return Err("invalid initial request".into());
+            };
+
+            respond(&Message::<Response<'_, ()>> {
+                source: init_node_id.clone(),
+                destination: source,
+                body: Response::InitOk {
+                    in_reply_to: message_id,
+                },
+            });
+
+            node_id = Some(init_node_id);
+            continue;
+        }
+
+        // Part of the protocol contract; no need to be robust here for local use
+        let node_id = node_id
+            .as_ref()
+            .ok_or("node ID not set on first iteration")?
+            .clone();
+
+        // Let's act like this actually increases throughput...
+        thread::spawn({
+            let store = Arc::clone(&store);
+            move || {
+                if let Err(e) = process(m, node_id, NodeMessageIdGenerator, store) {
+                    // We could panic here but we will either send errors out anyway, or
+                    // fail to reply; in any case, failure will be caught.
+                    eprintln!("processing failed: {}", e);
+                };
+            }
         });
     }
 }
