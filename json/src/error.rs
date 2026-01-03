@@ -49,6 +49,8 @@ pub enum Kind {
     InvalidHexCharacter(char),
     /// The input contained invalid Unicode.
     UnicodeError(UnicodeError),
+    /// Stack depth exceeded.
+    NestingTooDeep(usize),
 }
 
 /// Invalid Unicode was encountered.
@@ -114,6 +116,9 @@ impl Display for Kind {
             }
             Self::UnicodeError(UnicodeError::InvalidUTF8Start(byte)) => {
                 write!(f, "invalid UTF8 start byte: '{:x}'", byte)
+            }
+            Self::NestingTooDeep(depth) => {
+                write!(f, "excessive value nesting, found depth {depth}")
             }
         }
     }

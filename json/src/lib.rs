@@ -25,14 +25,22 @@ const ARRAY_OPEN: u8 = b'[';
 const ARRAY_SEP: u8 = b',';
 const ARRAY_CLOSE: u8 = b']';
 
+/// Maximum permissible depth in parsing values. Documents with values (objects, arrays)
+/// nested deeper than this are rejected.
+const MAX_DEPTH: usize = 256;
+
 type ParseResult<T> = std::result::Result<T, error::Error>;
 
+/// Parse the provided input into a JSON [`Value`].
+///
+/// Short-hand for [`Parser::new`] followed by [`Parser::parse`].
 pub fn parse(data: &[u8]) -> ParseResult<Value> {
     let mut parser = Parser::new(data);
 
     parser.parse()
 }
 
+/// A [JSON value](https://datatracker.ietf.org/doc/html/rfc8259#section-3).
 #[derive(Debug, PartialEq)]
 pub enum Value {
     String(String),
@@ -417,6 +425,9 @@ pub struct Parser<R: Read> {
     /// pending pairing with a subsequent low surrogate (at which point the slot is
     /// cleared again).
     pending_high_surrogate: Option<NonZero<u16>>,
+    /// Current stack depth in parsing values (in nested arrays, objects). Prevents
+    /// stack overflows in the parser (best-effort, as we can't know host stack sizes).
+    depth: usize,
 }
 
 impl<R: Read> Parser<R> {
@@ -429,13 +440,30 @@ impl<R: Read> Parser<R> {
             stream,
             stream_pos: 0,
             pending_high_surrogate: None,
+            depth: 0,
         }
     }
 
     /// Entrypoint into parsing. Will try to parse the input as a [JSON
     /// *value*](https://www.json.org/json-en.html).
     pub fn parse(&mut self) -> ParseResult<Value> {
-        self.visit_value()
+        let value = self.visit_value()?;
+
+        // Multi-value documents are not supported: additional data in the stream is a
+        // failure.
+        //
+        // Note, this technically reads one byte too much from the input, for a nicer
+        // report ("which byte was actually problematic"); `peek` has the same issue. As
+        // we return the byte to the caller in the error, this should be OK (caller can
+        // reconstruct everything).
+        match self.stream.next() {
+            Some(Ok(more)) => Err(self.err(InvalidByte {
+                byte: more,
+                reason: "excessive data in input after parsing one JSON value".into(),
+            })),
+            Some(Err(e)) => Err(self.err(Io(e))),
+            None => Ok(value),
+        }
     }
 
     /// Get the next byte from the underlying reader. Calling this method signals a
@@ -461,6 +489,11 @@ impl<R: Read> Parser<R> {
     }
 
     fn visit_value(&mut self) -> ParseResult<Value> {
+        self.depth += 1;
+        if self.depth >= MAX_DEPTH {
+            return Err(self.err(NestingTooDeep(self.depth)));
+        }
+
         self.skip_whitespace()?;
 
         // Peek ahead, but leave actual token consumption to implementations themselves.
@@ -483,6 +516,7 @@ impl<R: Read> Parser<R> {
             _ => return Err(self.err(UnexpectedEOF)),
         };
         self.skip_whitespace()?;
+        self.depth -= 1;
 
         Ok(val)
     }
@@ -634,33 +668,42 @@ impl<R: Read> Parser<R> {
                     }
                     b => break Err(self.err(InvalidEscapeSequence(b))),
                 },
-                byte @ 0..=127 => s.push(byte as char), // ASCII: encoding == codepoint
-                byte => {
-                    assert!(0b1000_0000 & byte != 0, "continuation bit is set");
+                ctrl_byte @ 0x00..=0x1F => {
+                    // Note: DELETE aka 0x7F is included in `u8.is_ascii_control()`, but
+                    // permitted literally in JSON strings, cf.
+                    // https://datatracker.ietf.org/doc/html/rfc8259#section-7.
+                    return Err(self.err(InvalidByte {
+                        byte: ctrl_byte,
+                        reason: "unescaped control character".into(),
+                    }));
+                }
+                byte @ 0x20..=0x7F => s.push(byte as char), // ASCII: encoding == codepoint
+                utf8_byte @ 0x80.. => {
+                    assert!(0b1000_0000 & utf8_byte != 0, "continuation bit is set");
                     let mut bytes = [0u8; 4];
-                    bytes[0] = byte;
+                    bytes[0] = utf8_byte;
 
                     // Assume UTF8, and consume one code point. For pattern see
                     // https://en.wikipedia.org/wiki/UTF-8#Description. A bit repetitive
                     // below, but this way we only touch subsequent bytes if the start
                     // byte actually looks OK. The `str` will be stack-allocated, which
                     // is a neat bonus.
-                    let i = if 0b0010_0000u8 & byte == 0 {
+                    let i = if 0b0010_0000u8 & utf8_byte == 0 {
                         bytes[1] = self.advance()?;
                         2
-                    } else if 0b0001_0000u8 & byte == 0 {
+                    } else if 0b0001_0000u8 & utf8_byte == 0 {
                         bytes[1] = self.advance()?;
                         bytes[2] = self.advance()?;
                         3
-                    } else if 0b0000_1000u8 & byte == 0 {
+                    } else if 0b0000_1000u8 & utf8_byte == 0 {
                         bytes[1] = self.advance()?;
                         bytes[2] = self.advance()?;
                         bytes[3] = self.advance()?;
                         4
                     } else {
-                        return Err(
-                            self.err(UnicodeError(error::UnicodeError::InvalidUTF8Start(byte)))
-                        );
+                        return Err(self.err(UnicodeError(error::UnicodeError::InvalidUTF8Start(
+                            utf8_byte,
+                        ))));
                     };
 
                     s.push_str(
@@ -844,6 +887,18 @@ impl<R: Read> Parser<R> {
             _ => return Ok(number),
         }
 
+        // At least one digit is mandatory now.
+        match self.advance()? {
+            byte @ b'0'..=b'9' => number.0.push(byte as char),
+            byte => {
+                return Err(self.err(InvalidByte {
+                    byte,
+                    reason: "expected at least one digit for fractional part".into(),
+                }));
+            }
+        }
+
+        // Any further digits are optional.
         loop {
             match self.stream.peek() {
                 Some(Ok(byte @ b'0'..=b'9')) => {
