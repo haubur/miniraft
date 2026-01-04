@@ -1,0 +1,7 @@
+{
+    "rust-analyzer.rustfmt.extraArgs": [
+        // Relying on some unstable features, see `rustfmt.toml`. This only needs
+        // nightly available/installed, nothing else (rustup toolchain install nightly).
+        "+nightly",
+    ],
+}

@@ -1,16 +1,10 @@
-use std::{
-    sync::{Arc, Mutex},
-    thread,
-};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
-use kv::{
-    Store,
-    infra::{process, read, respond},
-};
-use maelstrom::{
-    NodeMessageIdGenerator,
-    rpc::{Message, Request, Response},
-};
+use kv::Store;
+use kv::infra::{process, read, respond};
+use maelstrom::NodeMessageIdGenerator;
+use maelstrom::rpc::{Message, Request, Response};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Global and stable across a node lifecycle

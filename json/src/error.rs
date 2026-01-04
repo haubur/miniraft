@@ -1,4 +1,5 @@
-use std::{char, fmt::Display, io, str};
+use std::fmt::Display;
+use std::{char, io, str};
 
 /// An error in JSON processing.
 #[derive(Debug)]

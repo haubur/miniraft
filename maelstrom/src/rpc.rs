@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 
-use json::{
-    Value as JSONValue,
-    serde::{Deserialize, Serialize},
-};
+use json::Value as JSONValue;
+use json::serde::{Deserialize, Serialize};
 
 use crate::{NodeId, NodeMessageId};
 

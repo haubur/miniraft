@@ -1,9 +1,11 @@
 //! A bit like [serde](https://serde.rs/) except much simpler (no derive macros, ...).
 //! Conversions are therefore very verbose.
 
-use std::{error::Error, fmt::Display};
+use std::error::Error;
+use std::fmt::Display;
 
-use crate::{Value, conversions::from_value::TryFromError};
+use crate::Value;
+use crate::conversions::from_value::TryFromError;
 
 /// Serialize a type into a JSON representation.
 pub trait Serialize {
@@ -55,12 +57,9 @@ impl Error for DeserializeError {}
 /// and/or [`TryFrom`] etc. on generic stdlib types is error-prone as it can lead to
 /// infinite recursion. Being explicit with our own traits is much simpler and safer.
 pub mod stddlib_impls {
-    use crate::{
-        Value,
-        serde::{DeserializeError, SerializeError},
-    };
-
     use super::{Deserialize, Serialize};
+    use crate::Value;
+    use crate::serde::{DeserializeError, SerializeError};
 
     // Primitives, non-generic
 

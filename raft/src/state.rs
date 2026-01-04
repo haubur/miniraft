@@ -1,12 +1,8 @@
-use std::{
-    collections::HashMap,
-    fmt::{self, Display},
-};
+use std::collections::HashMap;
+use std::fmt::{self, Display};
 
-use json::{
-    Value as JSONValue,
-    serde::{Deserialize, Serialize},
-};
+use json::Value as JSONValue;
+use json::serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Candidate(pub u64);
@@ -187,8 +183,9 @@ pub enum State<C> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use json::Value as JSONValue;
+
+    use super::*;
 
     #[derive(Debug, PartialEq)]
     struct TestCommand(String);

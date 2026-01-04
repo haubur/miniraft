@@ -1,11 +1,9 @@
-use std::{
-    collections::HashMap,
-    fmt::{Display, Write},
-    io::{BufReader, Bytes, Read},
-    iter::Peekable,
-    num::NonZero,
-    str,
-};
+use std::collections::HashMap;
+use std::fmt::{Display, Write};
+use std::io::{BufReader, Bytes, Read};
+use std::iter::Peekable;
+use std::num::NonZero;
+use std::str;
 
 pub mod error;
 pub mod serde;
@@ -213,8 +211,9 @@ pub mod conversions {
     }
 
     pub mod from_value {
-        use crate::{Number, Value};
         use std::num::{ParseFloatError, ParseIntError};
+
+        use crate::{Number, Value};
 
         /// An error to signal unsuccessful conversion from [`Value`] to some target
         /// type.

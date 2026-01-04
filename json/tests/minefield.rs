@@ -1,7 +1,11 @@
 //! Tests from <https://seriot.ch/software/parsing_json.html>, aka
 //! <https://github.com/nst/JSONTestSuite>.
 
-use std::{error::Error, fmt::Display, fs, io::Read, path::PathBuf};
+use std::error::Error;
+use std::fmt::Display;
+use std::fs;
+use std::io::Read;
+use std::path::PathBuf;
 
 #[derive(PartialEq, PartialOrd, Eq, Ord)]
 enum Expect {

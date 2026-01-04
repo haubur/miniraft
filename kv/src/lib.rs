@@ -1,6 +1,9 @@
-use std::{collections::HashMap, fmt::Debug, hash::Hash};
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::hash::Hash;
 
-use json::{Value as JSONValue, conversions::from_value::TryFromError};
+use json::Value as JSONValue;
+use json::conversions::from_value::TryFromError;
 
 /// Infrastructure kerfuffle (not domain-specific).
 pub mod infra;

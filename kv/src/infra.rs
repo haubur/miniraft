@@ -1,8 +1,8 @@
 use std::error::Error;
+use std::fmt::Debug;
 use std::hash::Hash;
 use std::io::stdin;
-use std::sync::Mutex;
-use std::{fmt::Debug, sync::Arc};
+use std::sync::{Arc, Mutex};
 
 use json::serde::{Deserialize, Serialize};
 use maelstrom::rpc::{Message, Request, ReservedErrorCode, Response};
