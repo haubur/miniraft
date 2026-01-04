@@ -14,24 +14,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "kv"
-version = "0.1.0"
-dependencies = [
- "json",
- "maelstrom",
- "raft",
-]
-
-[[package]]
-name = "maelstrom"
-version = "0.1.0"
-dependencies = [
- "json",
-]
-
-[[package]]
 name = "raft"
 version = "0.1.0"
 dependencies = [
  "json",
+ "rand",
 ]
+
+[[package]]
+name = "rand"
+version = "0.1.0"

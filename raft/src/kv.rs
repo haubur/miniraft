@@ -4,6 +4,7 @@ use std::hash::Hash;
 
 use json::Value as JSONValue;
 use json::conversions::from_value::TryFromError;
+use json::serde::{Deserialize, Serialize};
 
 /// Infrastructure kerfuffle (not domain-specific).
 pub mod infra;
@@ -50,6 +51,7 @@ impl<K: Hash + Eq, V: PartialEq> Store<K, V> {
     }
 }
 
+#[derive(Default, Clone)]
 pub struct Put {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
@@ -64,35 +66,29 @@ impl Debug for Put {
     }
 }
 
-impl From<&Put> for JSONValue {
-    fn from(value: &Put) -> Self {
-        Self::Object(HashMap::from([
-            ("key".to_string(), value.key.as_slice().into()),
-            ("value".to_string(), value.value.as_slice().into()),
-        ]))
+impl Serialize for Put {
+    fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
+        Ok(JSONValue::Object(HashMap::from([
+            ("key".to_string(), self.key.as_slice().into()),
+            ("value".to_string(), self.value.as_slice().into()),
+        ])))
     }
 }
 
-impl TryFrom<JSONValue> for Put {
-    type Error = TryFromError;
-
-    fn try_from(value: JSONValue) -> Result<Self, Self::Error> {
+impl Deserialize for Put {
+    fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
         if let JSONValue::Object(mut map) = value {
             match (map.remove("key"), map.remove("value")) {
                 (Some(key), Some(value)) => Ok(Self {
                     key: key.try_into()?,
                     value: value.try_into()?,
                 }),
-                _ => Err(TryFromError {
-                    value: JSONValue::Object(map),
-                    reason: None,
-                }),
+                _ => Err(json::serde::DeserializeError::InvalidValue(
+                    JSONValue::Object(map),
+                )),
             }
         } else {
-            Err(TryFromError {
-                value,
-                reason: None,
-            })
+            Err(json::serde::DeserializeError::InvalidValue(value))
         }
     }
 }

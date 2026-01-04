@@ -69,6 +69,30 @@ pub mod stddlib_impls {
         }
     }
 
+    /// Mainly useful to plug in bogus types into generic parameters where it doesn't
+    /// matter.
+    impl Deserialize for () {
+        fn deserialize(_: Value) -> Result<Self, super::DeserializeError> {
+            Ok(())
+        }
+    }
+
+    impl Serialize for bool {
+        fn serialize(&self) -> Result<Value, SerializeError> {
+            Ok(Value::Bool(*self))
+        }
+    }
+
+    impl Deserialize for bool {
+        fn deserialize(value: Value) -> Result<Self, super::DeserializeError> {
+            if let Value::Bool(b) = value {
+                Ok(b)
+            } else {
+                Err(DeserializeError::InvalidValue(value))
+            }
+        }
+    }
+
     impl Serialize for String {
         fn serialize(&self) -> Result<Value, SerializeError> {
             Ok(self.as_str().into())

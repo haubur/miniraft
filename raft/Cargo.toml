@@ -6,6 +6,7 @@ edition.workspace = true
 
 [dependencies]
 json.workspace = true
+rand.workspace = true
 
 
 [lints]

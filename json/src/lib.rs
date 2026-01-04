@@ -40,7 +40,7 @@ pub fn parse(data: &[u8]) -> ParseResult<Value> {
 }
 
 /// A [JSON value](https://datatracker.ietf.org/doc/html/rfc8259#section-3).
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Value {
     String(String),
     Number(Number),
@@ -130,7 +130,7 @@ impl Display for Value {
 ///
 /// Converting to native numeric types is up to consumers. Some common conversions are
 /// provided.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Number(String);
 
 /// Compare numbers in ascending order of precision, by actual numeric value.

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["raft", "json", "kv", "base64", "maelstrom"]
+members = ["raft", "json", "base64", "rand"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,10 +8,9 @@ edition = "2024"
 
 [workspace.dependencies]
 base64 = { path = "base64" }
-maelstrom = { path = "maelstrom" }
 json = { path = "json" }
-kv = { path = "kv" }
 raft = { path = "raft" }
+rand = { path = "rand" }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
