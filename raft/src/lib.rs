@@ -74,15 +74,18 @@ where
                 let state = Arc::clone(&self.state);
 
                 move || {
-                    for req in incoming.iter() {
+                    for msg in incoming.iter() {
                         // Check if another node has a more advanced logical clock.
-                        let remote_term = req.term();
+                        //
+                        // TODO: also REJECT if remote term is stale (TBD how RPC should
+                        // look like).
+                        let remote_term = msg.term();
                         state
                             .lock()
                             .expect("no poison")
                             .maybe_step_down(remote_term);
 
-                        match req {
+                        match msg {
                             msg @ rpc::RaftMessage::RequestVote { .. } => {
                                 eprintln!("received request for vote: {:?}", msg)
                             }

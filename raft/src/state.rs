@@ -260,7 +260,10 @@ pub(crate) enum State<C> {
         v: Volatile,
         l: Leader,
     },
-    // For internal ownership handling.
+    /// For internal ownership handling.
+    ///
+    /// TODO: revisit if we can refactor enum into product type, such that `p` and `v`
+    /// are common to all variants.
     Transitioning,
 }
 
@@ -319,14 +322,16 @@ impl<C> State<C> {
         let prev = mem::replace(self, Self::Transitioning);
 
         match prev {
-            Self::Candidate { p, v, .. } | Self::Leader { p, v, l: _ } => {
+            Self::Follower { p, v }
+            | Self::Candidate { p, v, .. }
+            | Self::Leader { p, v, l: _ } => {
                 *self = Self::Follower { p, v };
 
                 self.v_mut().extend_election_deadline();
 
                 eprintln!("became follower for term {}", self.p().current_term);
             }
-            _ => unreachable!("invalid transition"),
+            Self::Transitioning => unreachable!("in transition"),
         };
     }
 

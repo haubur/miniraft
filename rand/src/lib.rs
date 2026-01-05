@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::Read;
+use std::ops::RangeFull;
 
 const RANDOM_FILE: &str = "/dev/urandom";
 
@@ -17,6 +18,28 @@ pub fn rand() -> f64 {
     // u64 has no invalid bit patterns.
     let val = u64::from_ne_bytes(buf);
     (val as f64) / (u64::MAX as f64)
+}
+
+/// Shuffle an iterable.
+///
+/// Allocates.
+#[cfg(unix)]
+pub fn shuffle<T>(mut items: Vec<T>) -> Vec<T> {
+    let n = items.len();
+    let mut new = Vec::with_capacity(n);
+
+    for _ in 0..=1_000 {
+        new.extend(items.extract_if(RangeFull, |_| rand() > 0.5));
+
+        if items.is_empty() {
+            break;
+        }
+    }
+
+    assert!(items.is_empty(), "did not finish in maximum iterations");
+    assert_eq!(new.len(), n, "all elements should have shifted over");
+
+    new
 }
 
 #[cfg(test)]

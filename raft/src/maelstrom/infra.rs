@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::io::stdin;
 use std::sync::mpsc::Sender;
+use std::thread;
 
 use json::serde::{Deserialize, Serialize};
 
@@ -33,7 +34,7 @@ pub fn read_and_handle_init(buf: &mut String) -> Result<(NodeId, Vec<NodeId>), B
     Ok((node_id, node_ids))
 }
 
-pub fn handle_outgoing<C: Serialize + Clone>(
+pub fn handle_outgoing<C: Serialize + Clone + Send>(
     this_node: NodeId,
     remote_nodes: &[String],
     msg: crate::rpc::RaftMessage<C>,
@@ -74,15 +75,30 @@ pub fn read<M: Deserialize + Debug>(buf: &mut String) -> Result<M, Box<dyn Error
 }
 
 /// Broadcast a message body from this node to others.
-pub fn broadcast<B: Serialize + Clone>(this: NodeId, destinations: &[NodeId], body: B) {
+pub fn broadcast<B: Serialize + Clone + Send>(this: NodeId, destinations: &[NodeId], body: B) {
     eprintln!("broadcasting from {} to {:?}", this, destinations);
-    for node in destinations {
-        send(&MessageEnvelope {
-            source: this.clone(),
-            destination: node.clone(),
-            body: body.clone(),
-        });
-    }
+
+    thread::scope(|scope| {
+        for (i, node) in destinations.iter().enumerate() {
+            let source = this.clone();
+            let destination = node.clone();
+            let body = body.clone();
+
+            // "Servers [..] issue RPCs in parallel for best performance." This is a bit
+            // pointless sending to STDOUT, but simulate this at least. This should lead
+            // to different observed orders from time to time.
+            thread::Builder::new()
+                .name(format!("broadcast-send-{}-{}", i, node))
+                .spawn_scoped(scope, move || {
+                    send(&MessageEnvelope {
+                        source,
+                        destination,
+                        body,
+                    })
+                })
+                .expect("thread spawn should always succeed");
+        }
+    })
 }
 
 /// Responds on stdout.
