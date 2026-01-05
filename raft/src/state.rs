@@ -11,29 +11,18 @@ use json::serde::{Deserialize, DeserializeError, Serialize, SerializeError};
 
 use crate::{ELECTION_TIMEOUT, NodeID, rpc};
 
-#[derive(Debug, Default, PartialEq)]
-pub struct CandidateID(pub u64);
-
-impl Display for CandidateID {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd)]
-pub struct Term(pub(crate) u64);
+pub struct Term(pub(super) u64);
 
 impl Term {
-    pub fn advance(&mut self, remote: Term) {
-        if *self > remote {
-            unreachable!("should check before advancing to incompatible term")
-        }
+    fn advance(&mut self, to: Term) {
+        assert!(to > *self, "need to advance forward");
 
-        *self = remote;
+        *self = to;
     }
 
-    pub fn step(&mut self) {
-        self.0 += 1;
+    fn step(&mut self) {
+        self.advance(Self(self.0 + 1));
     }
 }
 
@@ -44,9 +33,9 @@ impl Display for Term {
 }
 
 #[derive(Debug, Default, PartialEq, Clone)]
-pub struct LogEntry<C> {
-    pub cmd: C,
-    pub term: Term,
+pub(crate) struct LogEntry<C> {
+    pub(crate) cmd: C,
+    pub(crate) term: Term,
 }
 
 impl<C: Display> Display for LogEntry<C> {
@@ -73,7 +62,8 @@ impl<C: Default> Default for Log<C> {
 }
 
 impl<C> Log<C> {
-    pub fn get(&self, index: usize) -> Option<&LogEntry<C>> {
+    #[expect(unused)] // TODO
+    fn get(&self, index: usize) -> Option<&LogEntry<C>> {
         // Log is 1-indexed
         if index == 0 {
             None
@@ -82,27 +72,28 @@ impl<C> Log<C> {
         }
     }
 
-    pub fn last(&self) -> &LogEntry<C> {
+    fn last(&self) -> &LogEntry<C> {
         self.inner
             .last()
             .expect("should always have at least one entry")
     }
 
-    pub fn size(&self) -> usize {
+    fn size(&self) -> usize {
         self.inner.len()
     }
 
     // take ownership but make it read-only
-    pub fn append(&mut self, entries: Box<[LogEntry<C>]>) {
+    #[expect(unused)] // TODO
+    fn append(&mut self, entries: Box<[LogEntry<C>]>) {
         self.inner.extend(entries);
     }
 }
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Persistent<C> {
-    pub current_term: Term,
-    pub voted_for: Option<CandidateID>,
-    pub log: Log<C>,
+    pub(crate) current_term: Term,
+    pub(crate) voted_for: Option<NodeID>,
+    pub(crate) log: Log<C>,
 }
 
 impl<C: Display> Display for Persistent<C> {
@@ -190,13 +181,6 @@ impl<C: Deserialize> Persistent<C> {
 }
 
 #[derive(Debug)]
-pub(crate) struct VotingSession {
-    start: Instant,
-    term: Term,
-    votes: HashSet<NodeID>,
-}
-
-#[derive(Debug)]
 pub(crate) struct Volatile {
     #[expect(unused)]
     commit_index: usize,
@@ -206,16 +190,18 @@ pub(crate) struct Volatile {
     // Internal bookkeeping:
     /// This node's own ID.
     id: NodeID,
-    /// The current voting session, if any.
+    /// IDs of all other nodes in the cluster.
+    cluster_ids: Vec<NodeID>,
     election_deadline: Instant,
 }
 
 impl Volatile {
-    fn new(id: NodeID) -> Self {
+    fn new(id: NodeID, cluster_ids: Vec<NodeID>) -> Self {
         Self {
             commit_index: Default::default(),
             last_applied: Default::default(),
             id,
+            cluster_ids,
             election_deadline: Instant::now(),
         }
     }
@@ -225,8 +211,7 @@ impl Volatile {
     #[expect(unused)]
     fn reset(&mut self) {
         // This way we go through existing constructor and cannot forget any fields.
-        let prev = mem::take(&mut self.id);
-        *self = Self::new(prev)
+        *self = Self::new(mem::take(&mut self.id), mem::take(&mut self.cluster_ids))
     }
 
     fn extend_election_deadline(&mut self) {
@@ -238,9 +223,11 @@ impl Volatile {
 }
 
 #[derive(Debug, Default)]
-pub struct Leader {
-    pub next_index: HashMap<NodeID, usize>,
-    pub match_index: HashMap<NodeID, usize>,
+pub(crate) struct Leader {
+    #[expect(unused)] // TODO
+    pub(crate) next_index: HashMap<NodeID, usize>,
+    #[expect(unused)] // TODO
+    pub(crate) match_index: HashMap<NodeID, usize>,
 }
 
 #[derive(Debug)]
@@ -252,7 +239,7 @@ pub(crate) enum State<C> {
     Candidate {
         p: Persistent<C>,
         v: Volatile,
-        s: VotingSession,
+        votes: HashSet<NodeID>,
     },
     #[expect(unused)]
     Leader {
@@ -260,26 +247,37 @@ pub(crate) enum State<C> {
         v: Volatile,
         l: Leader,
     },
+
     /// For internal ownership handling.
     ///
+    /// We need ownership of e.g. leader state to potentially drop. Else we'd leak, if
+    /// we transitioned away. We can't take ownership as that would make for awkward
+    /// APIs; we generally do `&mut self`. As such, this variant enables a pattern like
+    /// [`Option::take`].
+    ///
     /// TODO: revisit if we can refactor enum into product type, such that `p` and `v`
-    /// are common to all variants.
+    /// are common to all variants (which they are, cf. [`State::p`] etc.)
     Transitioning,
 }
 
 /// For transitions, see Figure 4 of <https://raft.github.io/raft.pdf>.
 impl<C> State<C> {
-    pub(crate) fn new(id: NodeID, p: Persistent<C>) -> Self {
+    pub(super) fn new(id: NodeID, cluster_ids: Vec<NodeID>, p: Persistent<C>) -> Self {
         Self::Follower {
             p,
-            v: Volatile::new(id),
+            v: Volatile::new(id, cluster_ids),
         }
     }
 
-    pub(crate) fn begin_election(&mut self, outgoing: Sender<rpc::RaftMessage<C>>) {
-        eprintln!("beginning election");
+    /// Begin a new election if the election deadline has passed.
+    ///
+    /// > If a follower receives no communication over a period of time called the
+    /// > election timeout, then it assumes there is no viable leader and begins an
+    /// > election to choose a new leader.
+    pub(super) fn maybe_begin_election(&mut self, outgoing: Sender<rpc::RaftMessage<C>>) {
+        eprintln!("maybe beginning election");
 
-        if self.v().election_deadline >= Instant::now() {
+        if !self.election_timeout_passed() {
             eprintln!("election deadline in the future, doing nothing");
             return;
         }
@@ -291,38 +289,42 @@ impl<C> State<C> {
         }
     }
 
-    pub(crate) fn become_candidate(&mut self, outgoing: Sender<rpc::RaftMessage<C>>) {
-        // Need ownership of leader state to potentially drop. Else we leak, if we
-        // transition away from Leader state.
-        let prev = mem::replace(self, Self::Transitioning);
+    fn election_timeout_passed(&self) -> bool {
+        Instant::now() > self.v().election_deadline
+    }
 
-        match prev {
-            Self::Follower { p, v } => {
-                let session = VotingSession {
-                    start: Instant::now(),
-                    term: p.current_term,
-                    votes: HashSet::from([v.id.clone()]),
-                };
-                *self = Self::Candidate { p, v, s: session };
+    /// Become a candidate and start an election.
+    fn become_candidate(&mut self, outgoing: Sender<rpc::RaftMessage<C>>) {
+        assert!(self.election_timeout_passed());
+        eprintln!("becoming candidate and beginning election");
+
+        match mem::replace(self, Self::Transitioning) {
+            // Note, candidates also start new elections if election timeout passed.
+            Self::Follower { p, v, .. } | Self::Candidate { p, v, .. } => {
+                // Vote for ourselves. We're selfish like that.
+                let votes = HashSet::from([v.id.clone()]);
+                *self = Self::Candidate { p, v, votes };
 
                 self.p_mut().current_term.step();
+                self.p_mut().voted_for = None; // In this new term, not voted for anyone yet
 
-                // Do not call back for a while
+                // Give time for election to proceed.
                 self.v_mut().extend_election_deadline();
+
                 self.request_votes(outgoing);
 
                 eprintln!("became candidate for term {}", self.p().current_term);
             }
-            c @ Self::Candidate { .. } => *self = c,
-            _ => unreachable!("invalid transition"),
+            State::Leader { .. } => {
+                unreachable!("invalid transition (leader steps down to follower first)")
+            }
+            Self::Transitioning => unreachable!("in transition"),
         };
     }
 
     pub(crate) fn become_follower(&mut self) {
-        let prev = mem::replace(self, Self::Transitioning);
-
-        match prev {
-            Self::Follower { p, v }
+        match mem::replace(self, Self::Transitioning) {
+            Self::Follower { p, v, .. }
             | Self::Candidate { p, v, .. }
             | Self::Leader { p, v, l: _ } => {
                 *self = Self::Follower { p, v };
@@ -335,7 +337,26 @@ impl<C> State<C> {
         };
     }
 
+    pub(crate) fn become_leader(&mut self) {
+        match mem::replace(self, Self::Transitioning) {
+            Self::Candidate { p, v, .. } => {
+                *self = Self::Leader {
+                    p,
+                    v,
+                    l: Default::default(),
+                };
+
+                eprintln!("became leader for term {}", self.p().current_term);
+            }
+            Self::Follower { .. } | Self::Leader { .. } => unreachable!("invalid transition"),
+            Self::Transitioning => unreachable!("in transition"),
+        };
+    }
+
+    /// Request votes from *all* other nodes (**assumption**: a message router
+    /// broadcasts this -- we only send once here).
     pub(crate) fn request_votes(&mut self, outgoing: Sender<rpc::RaftMessage<C>>) {
+        eprintln!("requesting votes for term {}", self.p().current_term);
         outgoing
             .send(rpc::RaftMessage::RequestVote {
                 candidate_id: self.v().id.clone(),
@@ -351,30 +372,118 @@ impl<C> State<C> {
             .expect("receiver should never hang up");
     }
 
+    /// Handle a request for a leadership vote from some remote candidate.
+    pub(crate) fn handle_vote_request(
+        &mut self,
+        outgoing: Sender<rpc::RaftMessage<C>>,
+        candidate_id: String,
+        candidate_term: Term,
+        last_log_index: u64,
+        _last_log_term: Term,
+    ) {
+        match self {
+            Self::Follower { p, .. } => {
+                let vote_granted = {
+                    if candidate_term < p.current_term {
+                        // Candidate is in the logical past.
+                        false
+                    } else {
+                        match &p.voted_for {
+                            Some(c) if *c != candidate_id => {
+                                // We already voted for a different candidate in this
+                                // term.
+                                false
+                            }
+                            Some(_) | None => {
+                                // We have not voted yet in this term, or voted for this
+                                // candidate already. We will gladly cast our vote
+                                // again, if candidate's log is at least as up to date
+                                // as ours.
+                                last_log_index >= p.log.size() as u64
+                            }
+                        }
+                    }
+                };
+
+                eprintln!("granting vote to {}: {}", candidate_id, vote_granted);
+                outgoing
+                    .send(rpc::RaftMessage::RequestVoteResponse {
+                        remote_id: candidate_id.clone(),
+                        term: p.current_term,
+                        vote_granted,
+                    })
+                    .expect("receiver should never hang up");
+
+                if vote_granted {
+                    p.voted_for = Some(candidate_id);
+                    self.v_mut().extend_election_deadline();
+                }
+            }
+            Self::Candidate { p, .. } | Self::Leader { p, .. } => {
+                eprintln!("rejecting vote: am candidate or leader already");
+                outgoing
+                    .send(rpc::RaftMessage::RequestVoteResponse {
+                        remote_id: candidate_id,
+                        term: p.current_term,
+                        vote_granted: false,
+                    })
+                    .expect("receiver should never hang up");
+            }
+            Self::Transitioning => unreachable!("in transition"),
+        }
+    }
+
+    /// Handle a response to a previous vote request we sent.
+    ///
+    /// Note these responses can be arbitrarily delayed and correspondingly malformed.
     pub(crate) fn handle_vote_response(
         &mut self,
         remote_id: NodeID,
         remote_term: Term,
         vote_granted: bool,
     ) {
+        if !vote_granted {
+            // Too bad
+            return;
+        }
+
         match self {
-            Self::Candidate {
-                p,
-                s: VotingSession { start, term, votes },
-                ..
-            } if vote_granted && *term == p.current_term && remote_term == p.current_term => {
+            Self::Candidate { p, v, votes } => {
+                assert!(vote_granted);
+
+                if remote_term < p.current_term {
+                    eprintln!("ignoring vote: term {} < {}", remote_term, p.current_term);
+                    return;
+                }
+
                 votes.insert(remote_id);
-                eprintln!("have votes: {:?}", votes);
+                eprintln!("have {} votes: {:?}", votes.len(), votes);
+
+                // Note, no self receiver as we need to split borrow
+                if Self::won_election(&v.cluster_ids, votes) {
+                    self.become_leader();
+                }
             }
-            _ => eprintln!("ignoring vote"),
+            _ => {
+                // For example, because we _just became_ a leader.
+                eprintln!("ignoring vote: not currently a candidate (anymore)");
+            }
         };
     }
 
+    fn won_election(cluster_ids: &[NodeID], votes: &HashSet<NodeID>) -> bool {
+        let cluster_size = cluster_ids.len() + 1; // Cluster + ourselves
+        let n_majority = cluster_size / 2 + 1;
+        votes.len() >= n_majority
+    }
+
+    /// If the remote term is ahead, step down as we're behind.
     pub(crate) fn maybe_step_down(&mut self, remote: Term) {
         let p = self.p_mut();
         if p.current_term < remote {
             eprintln!("stepping down: {} < remote {}", p.current_term, remote);
             p.current_term.advance(remote);
+            p.voted_for = None; // In this new term, not voted for anyone yet
             self.become_follower();
         } else {
             eprintln!("not stepping down: {} >= remote {}", p.current_term, remote);
@@ -441,7 +550,7 @@ mod tests {
     fn test_persistent_serialize_deserialize_roundtrip() -> TestResult<()> {
         let there = Persistent {
             current_term: Term(3),
-            voted_for: Some(CandidateID(5)),
+            voted_for: Some("foo".into()),
             log: Log {
                 inner: vec![
                     LogEntry {

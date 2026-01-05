@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (incoming_tx, incoming_rx) = mpsc::channel();
     let (outgoing_tx, outgoing_rx) = mpsc::channel();
 
-    let raft: Raft<DummyCommand> = Raft::new(this_node.clone(), p);
+    let raft: Raft<DummyCommand> = Raft::new(this_node.clone(), remote_nodes.clone(), p);
     raft.start(incoming_rx, outgoing_tx);
 
     // Handle outgoing messages (which are all Raft messages).

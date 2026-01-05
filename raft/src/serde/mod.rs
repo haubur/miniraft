@@ -5,20 +5,7 @@ use std::collections::HashMap;
 use json::Value as JSONValue;
 use json::serde::{Deserialize, Serialize};
 
-use crate::state::{CandidateID, Log, LogEntry, Persistent, Term};
-
-impl Serialize for CandidateID {
-    fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
-        Ok(self.0.into())
-    }
-}
-
-impl Deserialize for CandidateID {
-    fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
-        let v: u64 = value.try_into()?;
-        Ok(Self(v))
-    }
-}
+use crate::state::{Log, LogEntry, Persistent, Term};
 
 impl Serialize for Term {
     fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {

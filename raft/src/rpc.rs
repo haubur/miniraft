@@ -135,10 +135,13 @@ pub enum RaftMessage<C> {
         last_log_term: Term,
     },
     RequestVoteResponse {
-        /// ID of the responding node.
+        /// ID of the remote node.
+        ///
+        /// When sending this response, the destination node. When receiving this
+        /// response, the source node.
         remote_id: NodeID,
-        /// Remote node's term, for candidate to update itself.
-        remote_term: Term,
+        /// Node's term, for candidate to update itself.
+        term: Term,
         /// If true, candidate received vote.
         vote_granted: bool,
     },
@@ -158,9 +161,7 @@ impl<C> RaftMessage<C> {
                 candidate_term: term,
                 ..
             }
-            | RaftMessage::RequestVoteResponse {
-                remote_term: term, ..
-            } => *term,
+            | RaftMessage::RequestVoteResponse { term, .. } => *term,
         }
     }
 }
@@ -244,12 +245,12 @@ impl<C: Serialize> Serialize for RaftMessage<C> {
             }
             RaftMessage::RequestVoteResponse {
                 remote_id,
-                remote_term,
+                term,
                 vote_granted,
             } => {
                 map.insert("type".into(), "request_vote_response".into());
                 map.insert("remote_id".into(), remote_id.as_str().into());
-                map.insert("remote_term".into(), remote_term.0.into());
+                map.insert("term".into(), term.0.into());
                 map.insert("vote_granted".into(), (*vote_granted).into());
             }
         }
@@ -329,13 +330,13 @@ impl<C: Deserialize> Deserialize for RaftMessage<C> {
                 },
                 "request_vote_response" => match (
                     body.remove("remote_id"),
-                    body.remove("remote_term"),
+                    body.remove("term"),
                     body.remove("vote_granted"),
                 ) {
-                    (Some(remote_id), Some(remote_term), Some(vote_granted)) => {
+                    (Some(remote_id), Some(term), Some(vote_granted)) => {
                         Ok(Self::RequestVoteResponse {
                             remote_id: Deserialize::deserialize(remote_id)?,
-                            remote_term: Deserialize::deserialize(remote_term)?,
+                            term: Deserialize::deserialize(term)?,
                             vote_granted: Deserialize::deserialize(vote_granted)?,
                         })
                     }

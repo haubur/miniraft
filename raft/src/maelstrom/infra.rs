@@ -36,7 +36,7 @@ pub fn read_and_handle_init(buf: &mut String) -> Result<(NodeId, Vec<NodeId>), B
 
 pub fn handle_outgoing<C: Serialize + Clone + Send>(
     this_node: NodeId,
-    remote_nodes: &[String],
+    remote_nodes: &[NodeId],
     msg: crate::rpc::RaftMessage<C>,
 ) {
     match msg {
@@ -103,6 +103,9 @@ pub fn broadcast<B: Serialize + Clone + Send>(this: NodeId, destinations: &[Node
 
 /// Responds on stdout.
 pub fn send<B: Serialize>(msg: &MessageEnvelope<B>) {
+    // Don't ask how I found out
+    assert_ne!(msg.source, msg.destination, "routing bug: sending to self");
+
     let msg = msg
         .serialize()
         .expect("all internal types should be serializable")
@@ -114,10 +117,8 @@ pub fn send<B: Serialize>(msg: &MessageEnvelope<B>) {
 
 pub fn handle_incoming<K, V, B, C>(
     MessageEnvelope {
-        // request source is destination for our reply and vice versa
-        source: destination,
-        destination: source,
-
+        source,
+        destination,
         body,
     }: MessageEnvelope<B>,
     raft_tx: Sender<RaftMessage<C>>,
@@ -130,8 +131,7 @@ where
     C: Serialize + 'static,
     B: Into<Message<K, V, C>>,
 {
-    // note: inverted!
-    eprintln!("processing message from {} for {}", destination, source);
+    eprintln!("processing message from {} for {}", source, destination);
 
     let msg = body.into();
 
@@ -141,7 +141,7 @@ where
 
             let msg = MessageEnvelope {
                 source: this,
-                destination,
+                destination: source,
                 body: Message::<K, V, C>::Error {
                     in_reply_to: Some(message_id),
                     message_id: msg_id_gen.next().expect("should never run out of IDs").0,
@@ -163,7 +163,7 @@ where
 
             let msg = MessageEnvelope {
                 source: this,
-                destination,
+                destination: source,
                 body: Message::<K, V, C>::Error {
                     in_reply_to: Some(message_id),
                     message_id: msg_id_gen.next().expect("should never run out of IDs").0,
@@ -186,7 +186,7 @@ where
 
             let msg = MessageEnvelope {
                 source: this,
-                destination,
+                destination: source,
                 body: Message::<K, V, C>::Error {
                     in_reply_to: Some(message_id),
                     message_id: msg_id_gen.next().expect("should never run out of IDs").0,
@@ -199,8 +199,26 @@ where
 
             Ok(())
         }
-        Message::Raft(msg) => {
+        Message::Raft(mut msg) => {
             eprintln!("forwarding raft message");
+
+            // If this is a response, need to swap out: the remote ID is *this* node
+            // (hence it made it to this point), but for this node's Raft engine it
+            // needs to be the remote aka sending node.
+            //
+            // A very unfortunate wart of the decoupling between Maelstrom and Raft we
+            // do.
+            msg = match msg {
+                RaftMessage::RequestVoteResponse {
+                    term, vote_granted, ..
+                } => RaftMessage::RequestVoteResponse {
+                    remote_id: source,
+                    term,
+                    vote_granted,
+                },
+                other => other,
+            };
+
             raft_tx.send(msg)?;
             Ok(())
         }
