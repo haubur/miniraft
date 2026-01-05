@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Display};
@@ -11,7 +12,7 @@ use json::serde::{Deserialize, DeserializeError, Serialize, SerializeError};
 
 use crate::{ELECTION_TIMEOUT, NodeID, rpc};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd, Eq, Ord)]
 pub struct Term(pub(super) u64);
 
 impl Term {
@@ -302,11 +303,12 @@ impl<C> State<C> {
             // Note, candidates also start new elections if election timeout passed.
             Self::Follower { p, v, .. } | Self::Candidate { p, v, .. } => {
                 // Vote for ourselves. We're selfish like that.
-                let votes = HashSet::from([v.id.clone()]);
+                let this = v.id.clone();
+                let votes = HashSet::from([this.clone()]);
                 *self = Self::Candidate { p, v, votes };
 
                 self.p_mut().current_term.step();
-                self.p_mut().voted_for = None; // In this new term, not voted for anyone yet
+                self.p_mut().voted_for = Some(this);
 
                 // Give time for election to proceed.
                 self.v_mut().extend_election_deadline();
@@ -348,14 +350,16 @@ impl<C> State<C> {
 
                 eprintln!("became leader for term {}", self.p().current_term);
             }
-            Self::Follower { .. } | Self::Leader { .. } => unreachable!("invalid transition"),
+            Self::Follower { .. } | Self::Leader { .. } => {
+                unreachable!("need to be candidate to become leader")
+            }
             Self::Transitioning => unreachable!("in transition"),
         };
     }
 
     /// Request votes from *all* other nodes (**assumption**: a message router
     /// broadcasts this -- we only send once here).
-    pub(crate) fn request_votes(&mut self, outgoing: Sender<rpc::RaftMessage<C>>) {
+    pub(crate) fn request_votes(&self, outgoing: Sender<rpc::RaftMessage<C>>) {
         eprintln!("requesting votes for term {}", self.p().current_term);
         outgoing
             .send(rpc::RaftMessage::RequestVote {
@@ -378,32 +382,65 @@ impl<C> State<C> {
         outgoing: Sender<rpc::RaftMessage<C>>,
         candidate_id: String,
         candidate_term: Term,
-        last_log_index: u64,
-        _last_log_term: Term,
+        candidate_last_log_index: u64,
+        candidate_last_log_term: Term,
     ) {
+        assert_ne!(
+            self.v().id,
+            candidate_id,
+            "should never be requested to vote for self"
+        );
+
         match self {
-            Self::Follower { p, .. } => {
+            Self::Follower { p, v, .. } => {
                 let vote_granted = {
                     if candidate_term < p.current_term {
                         // Candidate is in the logical past.
                         false
                     } else {
                         match &p.voted_for {
-                            Some(c) if *c != candidate_id => {
+                            Some(voted_for) if candidate_id != *voted_for => {
                                 // We already voted for a different candidate in this
                                 // term.
                                 false
                             }
                             Some(_) | None => {
                                 // We have not voted yet in this term, or voted for this
-                                // candidate already. We will gladly cast our vote
-                                // again, if candidate's log is at least as up to date
-                                // as ours.
-                                last_log_index >= p.log.size() as u64
+                                // candidate already. We will gladly cast our vote again
+                                // (to support that candidate retrying), under certain
+                                // conditions.
+
+                                let t = p.log.last().term;
+                                match candidate_last_log_term.cmp(&t) {
+                                    Ordering::Less => {
+                                        eprintln!(
+                                            "got candidate logs from past term {} < {}",
+                                            candidate_last_log_term, t
+                                        );
+                                        false
+                                    }
+                                    Ordering::Equal => {
+                                        let longer =
+                                            candidate_last_log_index >= p.log.size() as u64;
+                                        eprintln!(
+                                            "got candidate logs from same term {}, candidate log is longer: {}",
+                                            t, longer
+                                        );
+
+                                        longer
+                                    }
+                                    Ordering::Greater => true, // they are ahead
+                                }
                             }
                         }
                     }
                 };
+
+                if vote_granted {
+                    // Register new state *before* replying
+                    p.voted_for = Some(candidate_id.clone());
+                    v.extend_election_deadline();
+                }
 
                 eprintln!("granting vote to {}: {}", candidate_id, vote_granted);
                 outgoing
@@ -413,11 +450,6 @@ impl<C> State<C> {
                         vote_granted,
                     })
                     .expect("receiver should never hang up");
-
-                if vote_granted {
-                    p.voted_for = Some(candidate_id);
-                    self.v_mut().extend_election_deadline();
-                }
             }
             Self::Candidate { p, .. } | Self::Leader { p, .. } => {
                 eprintln!("rejecting vote: am candidate or leader already");
@@ -450,6 +482,7 @@ impl<C> State<C> {
         match self {
             Self::Candidate { p, v, votes } => {
                 assert!(vote_granted);
+                assert!(votes.contains(&v.id), "should always voted for ourselves");
 
                 if remote_term < p.current_term {
                     eprintln!("ignoring vote: term {} < {}", remote_term, p.current_term);
@@ -459,8 +492,8 @@ impl<C> State<C> {
                 votes.insert(remote_id);
                 eprintln!("have {} votes: {:?}", votes.len(), votes);
 
-                // Note, no self receiver as we need to split borrow
-                if Self::won_election(&v.cluster_ids, votes) {
+                let votes_received = votes.len();
+                if self.won_election(votes_received) {
                     self.become_leader();
                 }
             }
@@ -471,10 +504,10 @@ impl<C> State<C> {
         };
     }
 
-    fn won_election(cluster_ids: &[NodeID], votes: &HashSet<NodeID>) -> bool {
-        let cluster_size = cluster_ids.len() + 1; // Cluster + ourselves
+    fn won_election(&self, votes_received: usize) -> bool {
+        let cluster_size = self.v().cluster_ids.len() + 1; // Cluster + ourselves
         let n_majority = cluster_size / 2 + 1;
-        votes.len() >= n_majority
+        votes_received >= n_majority
     }
 
     /// If the remote term is ahead, step down as we're behind.

@@ -83,8 +83,12 @@ where
                         // Poll as frequently as feasible. Note, the election deadline
                         // this monitors can be bumped forward *at any time*, so we
                         // cannot just sleep once and wake up. So while we don't have
-                        // async niceties and to avoid callback hell, just poll.
-                        thread::sleep(Duration::from_millis(100));
+                        // async niceties and to avoid callback hell, just poll. Jitter
+                        // for good measure (break out of simultaneous startup more
+                        // efficiently).
+                        let d = Duration::from_millis(100);
+                        let jitter = Duration::from_secs_f64(d.as_secs_f64() * 0.2 * rand::rand());
+                        thread::sleep(d + jitter);
                     }
                 }
             })
