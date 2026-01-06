@@ -35,7 +35,7 @@ impl<K: Serialize, V: Serialize, C: Serialize> Serialize for Message<K, V, C> {
             } => {
                 let mut map: HashMap<String, JSONValue> = HashMap::new();
 
-                map.insert("type".into(), "error".into());
+                map.insert("type".into(), "error".serialize()?);
                 map.insert("in_reply_to".into(), in_reply_to.serialize()?);
                 map.insert("msg_id".into(), message_id.serialize()?);
                 map.insert("code".into(), code.serialize()?);
@@ -185,8 +185,6 @@ pub enum KVMessage<K, V> {
         to: V,
         message_id: MessageId,
     },
-
-    /// <https://github.com/jepsen-io/maelstrom/blob/cb7f07239012d85d2c0595fd942ddb4613205905/doc/workloads.md#workload-lin-kv>
     ReadResponse {
         in_reply_to: MessageId,
         value: V,
@@ -215,21 +213,21 @@ impl<C: Serialize> Serialize for RaftMessage<C> {
                 entries,
                 leader_commit,
             } => {
-                map.insert("type".into(), "append_entries".into());
-                map.insert("leader_term".into(), leader_term.0.into());
-                map.insert("leader_id".into(), leader_id.as_str().into());
-                map.insert("prev_log_index".into(), (*prev_log_index).into());
-                map.insert("prev_log_term".into(), prev_log_term.0.into());
+                map.insert("type".into(), "append_entries".serialize()?);
+                map.insert("leader_term".into(), leader_term.serialize()?);
+                map.insert("leader_id".into(), leader_id.serialize()?);
+                map.insert("prev_log_index".into(), prev_log_index.serialize()?);
+                map.insert("prev_log_term".into(), prev_log_term.serialize()?);
                 map.insert("entries".into(), entries.serialize()?);
-                map.insert("leader_commit".into(), (*leader_commit).into());
+                map.insert("leader_commit".into(), leader_commit.serialize()?);
             }
             RaftMessage::AppendEntriesResponse {
                 current_term,
                 success,
             } => {
-                map.insert("type".into(), "append_entries_response".into());
-                map.insert("current_term".into(), current_term.0.into());
-                map.insert("success".into(), (*success).into());
+                map.insert("type".into(), "append_entries_response".serialize()?);
+                map.insert("current_term".into(), current_term.serialize()?);
+                map.insert("success".into(), success.serialize()?);
             }
             RaftMessage::RequestVote {
                 candidate_id,
@@ -237,21 +235,21 @@ impl<C: Serialize> Serialize for RaftMessage<C> {
                 last_log_index,
                 last_log_term,
             } => {
-                map.insert("type".into(), "request_vote".into());
-                map.insert("candidate_id".into(), candidate_id.as_str().into());
-                map.insert("candidate_term".into(), candidate_term.0.into());
-                map.insert("last_log_index".into(), (*last_log_index).into());
-                map.insert("last_log_term".into(), last_log_term.0.into());
+                map.insert("type".into(), "request_vote".serialize()?);
+                map.insert("candidate_id".into(), candidate_id.serialize()?);
+                map.insert("candidate_term".into(), candidate_term.serialize()?);
+                map.insert("last_log_index".into(), last_log_index.serialize()?);
+                map.insert("last_log_term".into(), last_log_term.serialize()?);
             }
             RaftMessage::RequestVoteResponse {
                 remote_id,
                 term,
                 vote_granted,
             } => {
-                map.insert("type".into(), "request_vote_response".into());
-                map.insert("remote_id".into(), remote_id.as_str().into());
-                map.insert("term".into(), term.0.into());
-                map.insert("vote_granted".into(), (*vote_granted).into());
+                map.insert("type".into(), "request_vote_response".serialize()?);
+                map.insert("remote_id".into(), remote_id.serialize()?);
+                map.insert("term".into(), term.serialize()?);
+                map.insert("vote_granted".into(), vote_granted.serialize()?);
             }
         }
 
@@ -319,7 +317,7 @@ impl<C: Deserialize> Deserialize for RaftMessage<C> {
                         Some(last_log_index),
                         Some(last_log_term),
                     ) => Ok(Self::RequestVote {
-                        candidate_id: candidate_id.try_into()?,
+                        candidate_id: Deserialize::deserialize(candidate_id)?,
                         candidate_term: Deserialize::deserialize(candidate_term)?,
                         last_log_index: Deserialize::deserialize(last_log_index)?,
                         last_log_term: Deserialize::deserialize(last_log_term)?,
@@ -360,7 +358,7 @@ impl<K: Serialize, V: Serialize> Serialize for KVMessage<K, V> {
 
         match self {
             KVMessage::ReadRequest { key, message_id } => {
-                map.insert("type".into(), "read".into());
+                map.insert("type".into(), "read".serialize()?);
                 map.insert("key".into(), key.serialize()?);
                 map.insert("msg_id".into(), message_id.serialize()?);
             }
@@ -369,7 +367,7 @@ impl<K: Serialize, V: Serialize> Serialize for KVMessage<K, V> {
                 value,
                 message_id,
             } => {
-                map.insert("type".into(), "write".into());
+                map.insert("type".into(), "write".serialize()?);
                 map.insert("key".into(), key.serialize()?);
                 map.insert("value".into(), value.serialize()?);
                 map.insert("msg_id".into(), message_id.serialize()?);
@@ -380,7 +378,7 @@ impl<K: Serialize, V: Serialize> Serialize for KVMessage<K, V> {
                 to,
                 message_id,
             } => {
-                map.insert("type".into(), "cas".into());
+                map.insert("type".into(), "cas".serialize()?);
                 map.insert("key".into(), key.serialize()?);
                 map.insert("from".into(), from.serialize()?);
                 map.insert("to".into(), to.serialize()?);
@@ -391,7 +389,7 @@ impl<K: Serialize, V: Serialize> Serialize for KVMessage<K, V> {
                 value,
                 message_id,
             } => {
-                map.insert("type".into(), "read_ok".into());
+                map.insert("type".into(), "read_ok".serialize()?);
                 map.insert("in_reply_to".into(), in_reply_to.serialize()?);
                 map.insert("value".into(), value.serialize()?);
                 map.insert("msg_id".into(), message_id.serialize()?);
@@ -400,7 +398,7 @@ impl<K: Serialize, V: Serialize> Serialize for KVMessage<K, V> {
                 in_reply_to,
                 message_id,
             } => {
-                map.insert("type".into(), "write_ok".into());
+                map.insert("type".into(), "write_ok".serialize()?);
                 map.insert("in_reply_to".into(), in_reply_to.serialize()?);
                 map.insert("msg_id".into(), message_id.serialize()?);
             }
@@ -408,7 +406,7 @@ impl<K: Serialize, V: Serialize> Serialize for KVMessage<K, V> {
                 in_reply_to,
                 message_id,
             } => {
-                map.insert("type".into(), "cas_ok".into());
+                map.insert("type".into(), "cas_ok".serialize()?);
                 map.insert("in_reply_to".into(), in_reply_to.serialize()?);
                 map.insert("msg_id".into(), message_id.serialize()?);
             }

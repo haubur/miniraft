@@ -3,9 +3,9 @@
 
 use std::error::Error;
 use std::fmt::Display;
+use std::num::{ParseFloatError, ParseIntError};
 
 use crate::Value;
-use crate::conversions::from_value::TryFromError;
 
 /// Serialize a type into a JSON representation.
 pub trait Serialize {
@@ -32,21 +32,29 @@ impl Error for SerializeError {}
 
 #[derive(Debug)]
 pub enum DeserializeError {
-    InvalidConversion(TryFromError),
     InvalidValue(Value),
+    InvalidInteger(ParseIntError),
+    InvalidFloat(ParseFloatError),
 }
 
-impl From<TryFromError> for DeserializeError {
-    fn from(value: TryFromError) -> Self {
-        Self::InvalidConversion(value)
+impl From<ParseIntError> for DeserializeError {
+    fn from(value: ParseIntError) -> Self {
+        Self::InvalidInteger(value)
+    }
+}
+
+impl From<ParseFloatError> for DeserializeError {
+    fn from(value: ParseFloatError) -> Self {
+        Self::InvalidFloat(value)
     }
 }
 
 impl Display for DeserializeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidConversion(v) => write!(f, "invalid conversion: {v:?}"),
             Self::InvalidValue(v) => write!(f, "invalid object: {v:?}"),
+            Self::InvalidInteger(e) => write!(f, "invalid integer: {e:?}"),
+            Self::InvalidFloat(e) => write!(f, "invalid float: {e:?}"),
         }
     }
 }
@@ -58,8 +66,8 @@ impl Error for DeserializeError {}
 /// infinite recursion. Being explicit with our own traits is much simpler and safer.
 pub mod stddlib_impls {
     use super::{Deserialize, Serialize};
-    use crate::Value;
     use crate::serde::{DeserializeError, SerializeError};
+    use crate::{Number, Value};
 
     // Primitives, non-generic
 
@@ -84,7 +92,7 @@ pub mod stddlib_impls {
     }
 
     impl Deserialize for bool {
-        fn deserialize(value: Value) -> Result<Self, super::DeserializeError> {
+        fn deserialize(value: Value) -> Result<Self, DeserializeError> {
             if let Value::Bool(b) = value {
                 Ok(b)
             } else {
@@ -95,40 +103,55 @@ pub mod stddlib_impls {
 
     impl Serialize for String {
         fn serialize(&self) -> Result<Value, SerializeError> {
-            Ok(self.as_str().into())
+            Ok(Value::String(self.clone()))
         }
     }
 
     impl Deserialize for String {
-        fn deserialize(value: Value) -> Result<Self, super::DeserializeError> {
-            let v = value.try_into()?;
-            Ok(v)
+        fn deserialize(value: Value) -> Result<Self, DeserializeError> {
+            if let Value::String(s) = value {
+                Ok(s)
+            } else {
+                Err(DeserializeError::InvalidValue(value))
+            }
+        }
+    }
+
+    impl Serialize for &str {
+        fn serialize(&self) -> Result<Value, SerializeError> {
+            Ok(Value::String(self.to_string()))
         }
     }
 
     impl Serialize for u64 {
         fn serialize(&self) -> Result<Value, SerializeError> {
-            Ok((*self).into())
+            Ok(Value::Number(Number(self.to_string())))
         }
     }
 
     impl Deserialize for u64 {
-        fn deserialize(value: Value) -> Result<Self, super::DeserializeError> {
-            let v = value.try_into()?;
-            Ok(v)
+        fn deserialize(value: Value) -> Result<Self, DeserializeError> {
+            if let Value::Number(n) = value {
+                Ok(n.try_into()?)
+            } else {
+                Err(DeserializeError::InvalidValue(value))
+            }
         }
     }
 
     impl Serialize for i64 {
         fn serialize(&self) -> Result<Value, SerializeError> {
-            Ok((*self).into())
+            Ok(Value::Number(Number(self.to_string())))
         }
     }
 
     impl Deserialize for i64 {
-        fn deserialize(value: Value) -> Result<Self, super::DeserializeError> {
-            let v = value.try_into()?;
-            Ok(v)
+        fn deserialize(value: Value) -> Result<Self, DeserializeError> {
+            if let Value::Number(n) = value {
+                Ok(n.try_into()?)
+            } else {
+                Err(DeserializeError::InvalidValue(value))
+            }
         }
     }
 
@@ -168,7 +191,7 @@ pub mod stddlib_impls {
     where
         T: Deserialize,
     {
-        fn deserialize(value: Value) -> Result<Self, super::DeserializeError> {
+        fn deserialize(value: Value) -> Result<Self, DeserializeError> {
             if let Value::Array(values) = value {
                 let items: Result<Self, _> =
                     values.into_iter().map(|v| T::deserialize(v)).collect();

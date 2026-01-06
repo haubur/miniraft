@@ -572,7 +572,7 @@ mod tests {
 
     impl Deserialize for TestCommand {
         fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
-            let s: String = value.try_into()?;
+            let s: String = Deserialize::deserialize(value)?;
             Ok(Self(s))
         }
     }

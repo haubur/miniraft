@@ -9,13 +9,13 @@ use crate::state::{Log, LogEntry, Persistent, Term};
 
 impl Serialize for Term {
     fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
-        Ok(self.0.into())
+        self.0.serialize()
     }
 }
 
 impl Deserialize for Term {
     fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
-        let v: u64 = value.try_into()?;
+        let v: u64 = Deserialize::deserialize(value)?;
         Ok(Self(v))
     }
 }

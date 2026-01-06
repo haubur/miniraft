@@ -2,10 +2,9 @@ use std::collections::HashMap;
 use std::fmt::{Display, Write};
 use std::io::{BufReader, Bytes, Read};
 use std::iter::Peekable;
-use std::num::NonZero;
+use std::num::{NonZero, ParseFloatError, ParseIntError};
 use std::str;
 
-pub mod conversions;
 pub mod error;
 pub mod serde;
 
@@ -157,6 +156,54 @@ impl PartialEq for Number {
 
         // Fallback to direct string comparison.
         self.0 == other.0
+    }
+}
+
+impl TryFrom<Number> for u64 {
+    type Error = ParseIntError;
+
+    fn try_from(value: Number) -> Result<Self, Self::Error> {
+        value.0.parse()
+    }
+}
+
+impl TryFrom<&Number> for u64 {
+    type Error = ParseIntError;
+
+    fn try_from(value: &Number) -> Result<Self, Self::Error> {
+        value.0.parse()
+    }
+}
+
+impl TryFrom<Number> for i64 {
+    type Error = ParseIntError;
+
+    fn try_from(value: Number) -> Result<Self, Self::Error> {
+        value.0.parse()
+    }
+}
+
+impl TryFrom<&Number> for i64 {
+    type Error = ParseIntError;
+
+    fn try_from(value: &Number) -> Result<Self, Self::Error> {
+        value.0.parse()
+    }
+}
+
+impl TryFrom<Number> for f64 {
+    type Error = ParseFloatError;
+
+    fn try_from(value: Number) -> Result<Self, Self::Error> {
+        value.0.parse()
+    }
+}
+
+impl TryFrom<&Number> for f64 {
+    type Error = ParseFloatError;
+
+    fn try_from(value: &Number) -> Result<Self, Self::Error> {
+        value.0.parse()
     }
 }
 

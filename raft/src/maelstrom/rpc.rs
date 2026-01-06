@@ -20,8 +20,8 @@ where
 {
     fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
         let mut map: HashMap<String, JSONValue> = HashMap::new();
-        map.insert("src".into(), self.source.as_str().into());
-        map.insert("dest".into(), self.destination.as_str().into());
+        map.insert("src".into(), self.source.serialize()?);
+        map.insert("dest".into(), self.destination.serialize()?);
         map.insert("body".into(), self.body.serialize()?);
 
         Ok(JSONValue::Object(map))
@@ -35,9 +35,9 @@ where
     fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
         if let JSONValue::Object(mut msg) = value {
             match (msg.remove("src"), msg.remove("dest"), msg.remove("body")) {
-                (Some(src), Some(dest), Some(body)) => Ok(Self {
-                    source: src.try_into()?,
-                    destination: dest.try_into()?,
+                (Some(source), Some(destination), Some(body)) => Ok(Self {
+                    source: Deserialize::deserialize(source)?,
+                    destination: Deserialize::deserialize(destination)?,
                     body: Deserialize::deserialize(body)?,
                 }),
                 _ => Err(json::serde::DeserializeError::InvalidValue(
@@ -80,8 +80,8 @@ impl Deserialize for InitRequest {
                 body.remove("node_ids"),
             ) {
                 ("init", Some(msg_id), Some(node_id), Some(node_ids)) => Ok(Self {
-                    message_id: msg_id.try_into()?,
-                    node_id: node_id.try_into()?,
+                    message_id: Deserialize::deserialize(msg_id)?,
+                    node_id: Deserialize::deserialize(node_id)?,
                     node_ids: Deserialize::deserialize(node_ids)?,
                 }),
                 _ => Err(json::serde::DeserializeError::InvalidValue(
@@ -97,8 +97,8 @@ impl Deserialize for InitRequest {
 impl Serialize for InitResponse {
     fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
         let mut map: HashMap<String, JSONValue> = HashMap::new();
-        map.insert("type".into(), "init_ok".into());
-        map.insert("in_reply_to".into(), (self.in_reply_to).into());
+        map.insert("type".into(), "init_ok".serialize()?);
+        map.insert("in_reply_to".into(), self.in_reply_to.serialize()?);
 
         Ok(JSONValue::Object(map))
     }
