@@ -1,13 +1,13 @@
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
 
-use json::serde::{Deserialize, Serialize};
-use raft::Raft;
 use raft::maelstrom::NodeMessageIdGenerator;
-use raft::maelstrom::infra::{handle_incoming, handle_outgoing, read, read_and_handle_init};
+use raft::maelstrom::infra::{read, read_and_handle_init, route_incoming, send};
 use raft::maelstrom::rpc::MessageEnvelope;
 use raft::rpc::Message;
 use raft::state::Persistent;
+use raft::{Engine, Set};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = String::with_capacity(64);
@@ -17,22 +17,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let p = Persistent::default(); // start from scratch
 
-    let (incoming_tx, incoming_rx) = mpsc::channel();
-    let (outgoing_tx, outgoing_rx) = mpsc::channel();
+    let (raft_incoming_tx, raft_incoming_rx) = mpsc::channel();
+    let (raft_outgoing_tx, raft_outgoing_rx) = mpsc::channel();
 
-    let raft: Raft<DummyCommand> = Raft::new(this_node.clone(), remote_nodes.clone(), p);
-    raft.start(incoming_rx, outgoing_tx);
+    let (client_incoming_tx, client_incoming_rx) = mpsc::channel();
+    let (client_outgoing_tx, client_outgoing_rx) = mpsc::channel();
 
-    // Handle outgoing messages (which are all Raft messages).
+    let raft: Engine<Set<u64, i64>, HashMap<u64, i64>> =
+        Engine::new(this_node.clone(), remote_nodes.clone(), p);
+    raft.start(
+        raft_incoming_rx,
+        raft_outgoing_tx,
+        client_incoming_rx,
+        client_outgoing_tx,
+        NodeMessageIdGenerator,
+    );
+
+    // Handle outgoing Raft messages
     thread::Builder::new()
-        .name("raft-outgoing-msgs".into())
+        .name("handle-outgoing-raft-messages".into())
         .spawn({
-            let remote_nodes = remote_nodes.clone();
+            // let remote_nodes = remote_nodes.clone();
             let this_node = this_node.clone();
 
             move || {
-                for msg in outgoing_rx {
-                    handle_outgoing(this_node.clone(), &remote_nodes, msg);
+                for (node, msg) in raft_outgoing_rx {
+                    send(&MessageEnvelope {
+                        source: this_node.clone(),
+                        destination: node,
+                        body: msg,
+                    });
+                }
+            }
+        })
+        .expect("thread creation should succeed");
+
+    // Handle outgoing client messages
+    thread::Builder::new()
+        .name("handle-outgoing-client-messages".into())
+        .spawn({
+            let this_node = this_node.clone();
+
+            move || {
+                for (client, msg) in client_outgoing_rx {
+                    send(&MessageEnvelope {
+                        source: this_node.clone(),
+                        destination: client,
+                        body: msg,
+                    });
                 }
             }
         })
@@ -42,17 +74,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut n = 0;
     loop {
         n += 1;
-        let m: MessageEnvelope<Message<u64, i64, DummyCommand>> = read(&mut buf)?;
-        let node_id = this_node.clone();
-        let incoming_tx = incoming_tx.clone();
+        let m: MessageEnvelope<Message<u64, i64, Set<u64, i64>>> = read(&mut buf)?;
+        let raft_incoming_tx = raft_incoming_tx.clone();
+        let client_incoming_tx = client_incoming_tx.clone();
 
         // Handle message.
         thread::Builder::new()
             .name(format!("handle-incoming-msg-{n}"))
             .spawn({
                 move || {
-                    if let Err(e) = handle_incoming(m, incoming_tx, node_id, NodeMessageIdGenerator)
-                    {
+                    if let Err(e) = route_incoming(m, raft_incoming_tx, client_incoming_tx) {
                         // We could panic here but we will either send errors out anyway, or
                         // fail to reply; in any case, failure will be caught.
                         eprintln!("processing failed: {}", e);
@@ -60,21 +91,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             })
             .expect("thread creation should succeed");
-    }
-}
-
-/// TODO: make a fully-feature command suitable for Raft log
-#[derive(Debug, Clone, Default)]
-struct DummyCommand;
-
-impl Serialize for DummyCommand {
-    fn serialize(&self) -> Result<json::Value, json::serde::SerializeError> {
-        unimplemented!("not hit yet")
-    }
-}
-
-impl Deserialize for DummyCommand {
-    fn deserialize(_: json::Value) -> Result<Self, json::serde::DeserializeError> {
-        unimplemented!("not hit yet")
     }
 }

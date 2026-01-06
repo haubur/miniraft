@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use json::Value as JSONValue;
 use json::serde::{Deserialize, Serialize};
 
-use crate::NodeID;
 use crate::state::{Log, Term};
 
 pub(crate) type MessageId = u64;
@@ -13,36 +12,14 @@ pub(crate) type MessageId = u64;
 #[derive(Debug, Clone)]
 pub enum Message<K, V, C> {
     Raft(RaftMessage<C>),
-    KV(KVMessage<K, V>),
-    Error {
-        in_reply_to: Option<MessageId>,
-        message_id: MessageId,
-        code: u64,
-        text: String,
-    },
+    Client(ClientMessage<K, V>),
 }
 
 impl<K: Serialize, V: Serialize, C: Serialize> Serialize for Message<K, V, C> {
     fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
         match self {
             Message::Raft(r) => r.serialize(),
-            Message::KV(kv) => kv.serialize(),
-            Message::Error {
-                in_reply_to,
-                message_id,
-                code,
-                text,
-            } => {
-                let mut map: HashMap<String, JSONValue> = HashMap::new();
-
-                map.insert("type".into(), "error".serialize()?);
-                map.insert("in_reply_to".into(), in_reply_to.serialize()?);
-                map.insert("msg_id".into(), message_id.serialize()?);
-                map.insert("code".into(), code.serialize()?);
-                map.insert("text".into(), text.serialize()?);
-
-                Ok(JSONValue::Object(map))
-            }
+            Message::Client(kv) => kv.serialize(),
         }
     }
 }
@@ -50,47 +27,15 @@ impl<K: Serialize, V: Serialize, C: Serialize> Serialize for Message<K, V, C> {
 impl<K: Deserialize, V: Deserialize, C: Deserialize> Deserialize for Message<K, V, C> {
     fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
         // A bit inefficient... but there's no enum tag on this level.
-        if let Ok(r) = Deserialize::deserialize(value.clone()) {
-            return Ok(Self::Raft(r));
+        if let Ok(msg) = Deserialize::deserialize(value.clone()) {
+            return Ok(Self::Raft(msg));
         }
 
-        if let Ok(kv) = Deserialize::deserialize(value.clone()) {
-            return Ok(Self::KV(kv));
+        if let Ok(msg) = Deserialize::deserialize(value.clone()) {
+            return Ok(Self::Client(msg));
         }
 
-        if let JSONValue::Object(mut body) = value {
-            let Some(JSONValue::String(typ)) = body.remove("type") else {
-                return Err(json::serde::DeserializeError::InvalidValue(
-                    JSONValue::Object(body),
-                ));
-            };
-
-            match typ.as_str() {
-                "error" => match (
-                    body.remove("in_reply_to"),
-                    body.remove("msg_id"),
-                    body.remove("code"),
-                    body.remove("text"),
-                ) {
-                    (Some(in_reply_to), Some(message_id), Some(code), Some(text)) => {
-                        Ok(Self::Error {
-                            in_reply_to: Deserialize::deserialize(in_reply_to)?,
-                            message_id: Deserialize::deserialize(message_id)?,
-                            code: Deserialize::deserialize(code)?,
-                            text: Deserialize::deserialize(text)?,
-                        })
-                    }
-                    _ => Err(json::serde::DeserializeError::InvalidValue(
-                        JSONValue::Object(body),
-                    )),
-                },
-                _ => Err(json::serde::DeserializeError::InvalidValue(
-                    JSONValue::Object(body),
-                )),
-            }
-        } else {
-            Err(json::serde::DeserializeError::InvalidValue(value))
-        }
+        Err(json::serde::DeserializeError::InvalidValue(value))
     }
 }
 
@@ -99,8 +44,6 @@ pub enum RaftMessage<C> {
     AppendEntries {
         /// Leader's term
         leader_term: Term,
-        /// For followers to redirect requests.
-        leader_id: NodeID,
 
         /// Index of log entry immediately preceding new ones.
         prev_log_index: u64,
@@ -124,8 +67,6 @@ pub enum RaftMessage<C> {
         success: bool,
     },
     RequestVote {
-        /// The candidate requesting the vote.
-        candidate_id: NodeID,
         /// The requesting candidate's term.
         candidate_term: Term,
 
@@ -135,11 +76,6 @@ pub enum RaftMessage<C> {
         last_log_term: Term,
     },
     RequestVoteResponse {
-        /// ID of the remote node.
-        ///
-        /// When sending this response, the destination node. When receiving this
-        /// response, the source node.
-        remote_id: NodeID,
         /// Node's term, for candidate to update itself.
         term: Term,
         /// If true, candidate received vote.
@@ -169,7 +105,7 @@ impl<C> RaftMessage<C> {
 /// See also
 /// <https://github.com/jepsen-io/maelstrom/blob/cb7f07239012d85d2c0595fd942ddb4613205905/doc/workloads.md#workload-lin-kv>.
 #[derive(Debug, Clone)]
-pub enum KVMessage<K, V> {
+pub enum ClientMessage<K, V> {
     ReadRequest {
         key: K,
         message_id: MessageId,
@@ -198,6 +134,12 @@ pub enum KVMessage<K, V> {
         in_reply_to: MessageId,
         message_id: MessageId,
     },
+    ErrorResponse {
+        in_reply_to: MessageId,
+        message_id: MessageId,
+        code: u64,
+        text: String,
+    },
 }
 
 impl<C: Serialize> Serialize for RaftMessage<C> {
@@ -207,7 +149,6 @@ impl<C: Serialize> Serialize for RaftMessage<C> {
         match self {
             RaftMessage::AppendEntries {
                 leader_term,
-                leader_id,
                 prev_log_index,
                 prev_log_term,
                 entries,
@@ -215,7 +156,6 @@ impl<C: Serialize> Serialize for RaftMessage<C> {
             } => {
                 map.insert("type".into(), "append_entries".serialize()?);
                 map.insert("leader_term".into(), leader_term.serialize()?);
-                map.insert("leader_id".into(), leader_id.serialize()?);
                 map.insert("prev_log_index".into(), prev_log_index.serialize()?);
                 map.insert("prev_log_term".into(), prev_log_term.serialize()?);
                 map.insert("entries".into(), entries.serialize()?);
@@ -230,24 +170,17 @@ impl<C: Serialize> Serialize for RaftMessage<C> {
                 map.insert("success".into(), success.serialize()?);
             }
             RaftMessage::RequestVote {
-                candidate_id,
                 candidate_term,
                 last_log_index,
                 last_log_term,
             } => {
                 map.insert("type".into(), "request_vote".serialize()?);
-                map.insert("candidate_id".into(), candidate_id.serialize()?);
                 map.insert("candidate_term".into(), candidate_term.serialize()?);
                 map.insert("last_log_index".into(), last_log_index.serialize()?);
                 map.insert("last_log_term".into(), last_log_term.serialize()?);
             }
-            RaftMessage::RequestVoteResponse {
-                remote_id,
-                term,
-                vote_granted,
-            } => {
+            RaftMessage::RequestVoteResponse { term, vote_granted } => {
                 map.insert("type".into(), "request_vote_response".serialize()?);
-                map.insert("remote_id".into(), remote_id.serialize()?);
                 map.insert("term".into(), term.serialize()?);
                 map.insert("vote_granted".into(), vote_granted.serialize()?);
             }
@@ -269,7 +202,6 @@ impl<C: Deserialize> Deserialize for RaftMessage<C> {
             match typ.as_str() {
                 "append_entries" => match (
                     body.remove("leader_term"),
-                    body.remove("leader_id"),
                     body.remove("prev_log_index"),
                     body.remove("prev_log_term"),
                     body.remove("entries"),
@@ -277,14 +209,12 @@ impl<C: Deserialize> Deserialize for RaftMessage<C> {
                 ) {
                     (
                         Some(leader_term),
-                        Some(leader_id),
                         Some(prev_log_index),
                         Some(prev_log_term),
                         Some(entries),
                         Some(leader_commit),
                     ) => Ok(Self::AppendEntries {
                         leader_term: Deserialize::deserialize(leader_term)?,
-                        leader_id: Deserialize::deserialize(leader_id)?,
                         prev_log_index: Deserialize::deserialize(prev_log_index)?,
                         prev_log_term: Deserialize::deserialize(prev_log_term)?,
                         entries: Deserialize::deserialize(entries)?,
@@ -306,38 +236,27 @@ impl<C: Deserialize> Deserialize for RaftMessage<C> {
                     }
                 }
                 "request_vote" => match (
-                    body.remove("candidate_id"),
                     body.remove("candidate_term"),
                     body.remove("last_log_index"),
                     body.remove("last_log_term"),
                 ) {
-                    (
-                        Some(candidate_id),
-                        Some(candidate_term),
-                        Some(last_log_index),
-                        Some(last_log_term),
-                    ) => Ok(Self::RequestVote {
-                        candidate_id: Deserialize::deserialize(candidate_id)?,
-                        candidate_term: Deserialize::deserialize(candidate_term)?,
-                        last_log_index: Deserialize::deserialize(last_log_index)?,
-                        last_log_term: Deserialize::deserialize(last_log_term)?,
-                    }),
+                    (Some(candidate_term), Some(last_log_index), Some(last_log_term)) => {
+                        Ok(Self::RequestVote {
+                            candidate_term: Deserialize::deserialize(candidate_term)?,
+                            last_log_index: Deserialize::deserialize(last_log_index)?,
+                            last_log_term: Deserialize::deserialize(last_log_term)?,
+                        })
+                    }
                     _ => Err(json::serde::DeserializeError::InvalidValue(
                         JSONValue::Object(body),
                     )),
                 },
-                "request_vote_response" => match (
-                    body.remove("remote_id"),
-                    body.remove("term"),
-                    body.remove("vote_granted"),
-                ) {
-                    (Some(remote_id), Some(term), Some(vote_granted)) => {
-                        Ok(Self::RequestVoteResponse {
-                            remote_id: Deserialize::deserialize(remote_id)?,
-                            term: Deserialize::deserialize(term)?,
-                            vote_granted: Deserialize::deserialize(vote_granted)?,
-                        })
-                    }
+                "request_vote_response" => match (body.remove("term"), body.remove("vote_granted"))
+                {
+                    (Some(term), Some(vote_granted)) => Ok(Self::RequestVoteResponse {
+                        term: Deserialize::deserialize(term)?,
+                        vote_granted: Deserialize::deserialize(vote_granted)?,
+                    }),
                     _ => Err(json::serde::DeserializeError::InvalidValue(
                         JSONValue::Object(body),
                     )),
@@ -352,17 +271,17 @@ impl<C: Deserialize> Deserialize for RaftMessage<C> {
     }
 }
 
-impl<K: Serialize, V: Serialize> Serialize for KVMessage<K, V> {
+impl<K: Serialize, V: Serialize> Serialize for ClientMessage<K, V> {
     fn serialize(&self) -> Result<json::Value, json::serde::SerializeError> {
         let mut map: HashMap<String, JSONValue> = HashMap::new();
 
         match self {
-            KVMessage::ReadRequest { key, message_id } => {
+            Self::ReadRequest { key, message_id } => {
                 map.insert("type".into(), "read".serialize()?);
                 map.insert("key".into(), key.serialize()?);
                 map.insert("msg_id".into(), message_id.serialize()?);
             }
-            KVMessage::WriteRequest {
+            Self::WriteRequest {
                 key,
                 value,
                 message_id,
@@ -372,7 +291,7 @@ impl<K: Serialize, V: Serialize> Serialize for KVMessage<K, V> {
                 map.insert("value".into(), value.serialize()?);
                 map.insert("msg_id".into(), message_id.serialize()?);
             }
-            KVMessage::CASRequest {
+            Self::CASRequest {
                 key,
                 from,
                 to,
@@ -384,7 +303,7 @@ impl<K: Serialize, V: Serialize> Serialize for KVMessage<K, V> {
                 map.insert("to".into(), to.serialize()?);
                 map.insert("msg_id".into(), message_id.serialize()?);
             }
-            KVMessage::ReadResponse {
+            Self::ReadResponse {
                 in_reply_to,
                 value,
                 message_id,
@@ -394,7 +313,7 @@ impl<K: Serialize, V: Serialize> Serialize for KVMessage<K, V> {
                 map.insert("value".into(), value.serialize()?);
                 map.insert("msg_id".into(), message_id.serialize()?);
             }
-            KVMessage::WriteResponse {
+            Self::WriteResponse {
                 in_reply_to,
                 message_id,
             } => {
@@ -402,7 +321,7 @@ impl<K: Serialize, V: Serialize> Serialize for KVMessage<K, V> {
                 map.insert("in_reply_to".into(), in_reply_to.serialize()?);
                 map.insert("msg_id".into(), message_id.serialize()?);
             }
-            KVMessage::CASResponse {
+            Self::CASResponse {
                 in_reply_to,
                 message_id,
             } => {
@@ -410,13 +329,25 @@ impl<K: Serialize, V: Serialize> Serialize for KVMessage<K, V> {
                 map.insert("in_reply_to".into(), in_reply_to.serialize()?);
                 map.insert("msg_id".into(), message_id.serialize()?);
             }
+            Self::ErrorResponse {
+                in_reply_to,
+                message_id,
+                code,
+                text,
+            } => {
+                map.insert("type".into(), "error".serialize()?);
+                map.insert("in_reply_to".into(), in_reply_to.serialize()?);
+                map.insert("msg_id".into(), message_id.serialize()?);
+                map.insert("code".into(), code.serialize()?);
+                map.insert("text".into(), text.serialize()?);
+            }
         }
 
         Ok(JSONValue::Object(map))
     }
 }
 
-impl<K: Deserialize, V: Deserialize> Deserialize for KVMessage<K, V> {
+impl<K: Deserialize, V: Deserialize> Deserialize for ClientMessage<K, V> {
     fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
         if let JSONValue::Object(mut body) = value {
             let Some(JSONValue::String(typ)) = body.remove("type") else {
@@ -493,6 +424,24 @@ impl<K: Deserialize, V: Deserialize> Deserialize for KVMessage<K, V> {
                         in_reply_to: Deserialize::deserialize(in_reply_to)?,
                         message_id: Deserialize::deserialize(message_id)?,
                     }),
+                    _ => Err(json::serde::DeserializeError::InvalidValue(
+                        JSONValue::Object(body),
+                    )),
+                },
+                "error" => match (
+                    body.remove("in_reply_to"),
+                    body.remove("msg_id"),
+                    body.remove("code"),
+                    body.remove("text"),
+                ) {
+                    (Some(in_reply_to), Some(message_id), Some(code), Some(text)) => {
+                        Ok(Self::ErrorResponse {
+                            in_reply_to: Deserialize::deserialize(in_reply_to)?,
+                            message_id: Deserialize::deserialize(message_id)?,
+                            code: Deserialize::deserialize(code)?,
+                            text: Deserialize::deserialize(text)?,
+                        })
+                    }
                     _ => Err(json::serde::DeserializeError::InvalidValue(
                         JSONValue::Object(body),
                     )),

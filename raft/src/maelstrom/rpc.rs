@@ -3,14 +3,14 @@ use std::collections::HashMap;
 use json::Value as JSONValue;
 use json::serde::{Deserialize, Serialize};
 
-use super::NodeId;
+use crate::NodeID;
 use crate::rpc::MessageId;
 
 /// <https://github.com/jepsen-io/maelstrom/blob/cb7f07239012d85d2c0595fd942ddb4613205905/doc/protocol.md#message-bodies>
 #[derive(Debug)]
 pub struct MessageEnvelope<B> {
-    pub source: NodeId,
-    pub destination: NodeId,
+    pub source: NodeID,
+    pub destination: NodeID,
     pub body: B,
 }
 
@@ -55,8 +55,8 @@ where
 #[derive(Debug)]
 pub(crate) struct InitRequest {
     pub(crate) message_id: MessageId,
-    pub(crate) node_id: NodeId,
-    pub(crate) node_ids: Vec<NodeId>,
+    pub(crate) node_id: NodeID,
+    pub(crate) node_ids: Vec<NodeID>,
 }
 
 #[derive(Debug)]
