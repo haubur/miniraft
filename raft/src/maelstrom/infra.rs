@@ -67,20 +67,19 @@ pub fn send<B: Serialize>(msg: &MessageEnvelope<B>) {
     println!("{msg}");
 }
 
-pub fn route_incoming<K, V, B, C>(
+pub fn route_incoming<K, V, B, Cmd>(
     MessageEnvelope {
         source,
         destination,
         body,
     }: MessageEnvelope<B>,
-    raft_tx: Sender<(NodeID, RaftMessage<C>)>,
+    raft_tx: Sender<(NodeID, RaftMessage<Cmd>)>,
     client_tx: Sender<(NodeID, ClientMessage<K, V>)>,
-) -> Result<(), Box<dyn Error>>
-where
+) where
     K: Serialize + Hash + Eq + Debug + Send + 'static,
     V: Serialize + PartialEq + Debug + Send + 'static,
-    C: Serialize + 'static,
-    B: Into<Message<K, V, C>>,
+    Cmd: Serialize + 'static,
+    B: Into<Message<K, V, Cmd>>,
 {
     eprintln!("processing message from {} for {}", source, destination);
 
@@ -93,8 +92,9 @@ where
             | ClientMessage::CASRequest { .. }),
         ) => {
             eprintln!("forwarding client request message");
-            client_tx.send((source, req))?;
-            Ok(())
+            client_tx
+                .send((source, req))
+                .expect("client listener should never hang up");
         }
         Message::Client(
             ClientMessage::ReadResponse { .. }
@@ -102,12 +102,13 @@ where
             | ClientMessage::CASResponse { .. }
             | ClientMessage::ErrorResponse { .. },
         ) => {
-            unreachable!("responses should never be routed to nodes, only ever to clients");
+            eprintln!("error: responses should never be routed to nodes, only ever to clients");
         }
         Message::Raft(msg) => {
             eprintln!("forwarding raft message");
-            raft_tx.send((source, msg))?;
-            Ok(())
+            raft_tx
+                .send((source, msg))
+                .expect("client listener should never hang up");
         }
     }
 }

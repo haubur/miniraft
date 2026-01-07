@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::fmt::{self, Display};
+use std::fmt::{self, Debug, Display};
 use std::io::{self, Read, Write};
 use std::mem;
 use std::num::NonZero;
@@ -34,22 +34,19 @@ impl Display for Term {
     }
 }
 
-pub trait StateMachine: Default + Send {
-    type Command;
-    type Request;
-    type Response;
+pub trait StateMachine: Default + Send + std::fmt::Debug {
+    type Command: Debug;
 
     fn apply(&mut self, cmd: Self::Command);
-    fn respond(&self, req: Self::Request) -> Option<Self::Response>;
 }
 
 #[derive(Debug, Default, PartialEq, Clone)]
-pub(crate) struct LogEntry<C> {
-    pub(crate) cmd: C,
+pub(crate) struct LogEntry<Cmd> {
+    pub(crate) cmd: Cmd,
     pub(crate) term: Term,
 }
 
-impl<C: Display> Display for LogEntry<C> {
+impl<Cmd: Display> Display for LogEntry<Cmd> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "{}", self.cmd.to_string().escape_default())?;
         write!(f, "{}", self.term)
@@ -57,31 +54,31 @@ impl<C: Display> Display for LogEntry<C> {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct Log<C> {
-    pub(crate) inner: Vec<LogEntry<C>>,
+pub struct Log<Cmd> {
+    pub(crate) inner: Vec<LogEntry<Cmd>>,
 }
 
-impl<C: Default> Default for Log<C> {
+impl<Cmd: Default> Default for Log<Cmd> {
     fn default() -> Self {
         Self {
             inner: vec![LogEntry {
-                cmd: C::default(),
+                cmd: Cmd::default(),
                 term: Term::default(),
             }],
         }
     }
 }
 
-impl<C> Log<C> {
-    fn get(&self, index: NonZero<usize>) -> Option<&LogEntry<C>> {
+impl<Cmd> Log<Cmd> {
+    fn get(&self, index: NonZero<usize>) -> Option<&LogEntry<Cmd>> {
         self.inner.get(index.get() - 1)
     }
 
-    fn get_from(&self, index: NonZero<usize>) -> Option<&[LogEntry<C>]> {
+    fn get_from(&self, index: NonZero<usize>) -> Option<&[LogEntry<Cmd>]> {
         self.inner.get(index.get()..)
     }
 
-    fn last(&self) -> &LogEntry<C> {
+    fn last(&self) -> &LogEntry<Cmd> {
         self.inner
             .last()
             .expect("should always have at least one entry")
@@ -92,23 +89,23 @@ impl<C> Log<C> {
     }
 
     // take ownership but make it read-only
-    fn append(&mut self, entries: Box<[LogEntry<C>]>) {
+    fn append(&mut self, entries: Box<[LogEntry<Cmd>]>) {
         self.inner.extend(entries);
     }
 }
 
-#[derive(Debug, Default, PartialEq)]
-pub struct Persistent<C> {
+#[derive(Debug, PartialEq)]
+pub struct Persistent<Cmd> {
     pub(crate) current_term: Term,
     pub(crate) voted_for: Option<NodeID>,
-    pub(crate) log: Log<C>,
+    pub(crate) log: Log<Cmd>,
 }
 
-impl<C: Display> Display for Persistent<C> {
+impl<Cmd: Display> Display for Persistent<Cmd> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{}", self.current_term)?;
-        if let Some(ref c) = self.voted_for {
-            write!(f, "{c}")?;
+        writeln!(f, "{}/", self.current_term)?;
+        if let Some(ref voted_for) = self.voted_for {
+            write!(f, "{voted_for}/")?;
         }
         writeln!(f)?;
 
@@ -167,7 +164,7 @@ impl From<io::Error> for PersistenceError {
     }
 }
 
-impl<C: Serialize> Persistent<C> {
+impl<Cmd: Serialize> Persistent<Cmd> {
     /// Serializes out to a writer.
     pub fn persist(&self, dest: &mut impl Write) -> Result<(), PersistenceError> {
         let s = self.serialize()?.to_string();
@@ -177,7 +174,7 @@ impl<C: Serialize> Persistent<C> {
     }
 }
 
-impl<C: Deserialize> Persistent<C> {
+impl<Cmd: Deserialize> Persistent<Cmd> {
     /// Restores from a reader. The reader is read until EOF.
     pub fn restore(src: &mut impl Read) -> Result<Self, PersistenceError> {
         let mut buf = Vec::with_capacity(32);
@@ -189,7 +186,7 @@ impl<C: Deserialize> Persistent<C> {
 }
 
 #[derive(Debug)]
-pub(crate) struct Volatile<S: StateMachine> {
+pub(crate) struct Volatile {
     commit_index: usize,
     #[expect(unused)]
     last_applied: usize,
@@ -198,24 +195,22 @@ pub(crate) struct Volatile<S: StateMachine> {
     id: NodeID,
     /// IDs of all other nodes in the cluster.
     cluster_ids: Vec<NodeID>,
-    state_machine: S,
     election_deadline: Instant,
 }
 
-impl<S: StateMachine> Volatile<S> {
+impl Volatile {
     fn new(id: NodeID, cluster_ids: Vec<NodeID>) -> Self {
         Self {
             commit_index: Default::default(),
             last_applied: Default::default(),
             id,
             cluster_ids,
-            state_machine: Default::default(),
             election_deadline: Instant::now(),
         }
     }
 }
 
-impl<S: StateMachine> Volatile<S> {
+impl Volatile {
     #[expect(unused)]
     fn reset(&mut self) {
         // This way we go through existing constructor and cannot forget any fields.
@@ -239,19 +234,19 @@ pub(crate) struct Leader {
 }
 
 #[derive(Debug)]
-pub(crate) enum State<C, S: StateMachine> {
+pub(crate) enum State<S: StateMachine> {
     Follower {
-        p: Persistent<C>,
-        v: Volatile<S>,
+        p: Persistent<S::Command>,
+        v: Volatile,
     },
     Candidate {
-        p: Persistent<C>,
-        v: Volatile<S>,
+        p: Persistent<S::Command>,
+        v: Volatile,
         votes: HashSet<NodeID>,
     },
     Leader {
-        p: Persistent<C>,
-        v: Volatile<S>,
+        p: Persistent<S::Command>,
+        v: Volatile,
         l: Leader,
     },
 
@@ -268,8 +263,8 @@ pub(crate) enum State<C, S: StateMachine> {
 }
 
 /// For transitions, see Figure 4 of <https://raft.github.io/raft.pdf>.
-impl<C, S: StateMachine> State<C, S> {
-    pub(super) fn new(id: NodeID, cluster_ids: Vec<NodeID>, p: Persistent<C>) -> Self {
+impl<S: StateMachine> State<S> {
+    pub(super) fn new(id: NodeID, cluster_ids: Vec<NodeID>, p: Persistent<S::Command>) -> Self {
         Self::Follower {
             p,
             v: Volatile::new(id, cluster_ids),
@@ -281,7 +276,10 @@ impl<C, S: StateMachine> State<C, S> {
     /// > If a follower receives no communication over a period of time called the
     /// > election timeout, then it assumes there is no viable leader and begins an
     /// > election to choose a new leader.
-    pub(super) fn maybe_begin_election(&mut self, outgoing: Sender<(NodeID, rpc::RaftMessage<C>)>) {
+    pub(super) fn maybe_begin_election(
+        &mut self,
+        outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>,
+    ) {
         eprintln!("maybe beginning election");
 
         if !self.election_timeout_passed() {
@@ -301,7 +299,7 @@ impl<C, S: StateMachine> State<C, S> {
     }
 
     /// Become a candidate and start an election.
-    fn become_candidate(&mut self, outgoing: Sender<(NodeID, rpc::RaftMessage<C>)>) {
+    fn become_candidate(&mut self, outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>) {
         assert!(self.election_timeout_passed());
         eprintln!("becoming candidate and beginning election");
 
@@ -380,7 +378,7 @@ impl<C, S: StateMachine> State<C, S> {
     }
 
     /// Request votes from *all* other nodes.
-    pub(crate) fn request_votes(&self, outgoing: Sender<(NodeID, rpc::RaftMessage<C>)>) {
+    pub(crate) fn request_votes(&self, outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>) {
         eprintln!("requesting votes for term {}", self.p().current_term);
         for node in &self.v().cluster_ids {
             outgoing
@@ -409,7 +407,7 @@ impl<C, S: StateMachine> State<C, S> {
         candidate_term: Term,
         candidate_last_log_index: u64,
         candidate_last_log_term: Term,
-    ) -> rpc::RaftMessage<C> {
+    ) -> rpc::RaftMessage<S::Command> {
         eprintln!(
             "handling vote request for {} on term {} ({} / {})",
             candidate_id, candidate_term, candidate_last_log_index, candidate_last_log_term
@@ -553,9 +551,9 @@ impl<C, S: StateMachine> State<C, S> {
         }
     }
 
-    pub(crate) fn replicate_log(&mut self, outgoing: Sender<(NodeID, rpc::RaftMessage<C>)>)
+    pub(crate) fn replicate_log(&mut self, outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>)
     where
-        C: Clone,
+        S::Command: Clone,
     {
         let State::Leader {
             p,
@@ -613,7 +611,9 @@ impl<C, S: StateMachine> State<C, S> {
                 // leader_id: v.id.clone(),
                 prev_log_index,
                 prev_log_term,
-                entries: Log { inner: { entries } },
+                entries: Log {
+                    inner: { entries.clone() },
+                },
                 leader_commit: v.commit_index as u64,
             };
 
@@ -622,7 +622,13 @@ impl<C, S: StateMachine> State<C, S> {
                 continue;
             }
 
-            eprintln!("replicate log: sending {} entries to {}", n_entries, id);
+            eprintln!(
+                "replicate log: local size {}, sending {} entries to {}: {:?}",
+                p.log.size(),
+                n_entries,
+                id,
+                entries
+            );
             outgoing
                 .send((id.clone(), msg))
                 .expect("raft receiver should never hang up");
@@ -634,8 +640,7 @@ impl<C, S: StateMachine> State<C, S> {
         }
     }
 
-    #[expect(unused)]
-    pub(crate) fn append(&mut self, cmd: C) {
+    pub(crate) fn append(&mut self, cmd: S::Command) {
         let term = self.p().current_term;
         self.p_mut()
             .log
@@ -646,35 +651,28 @@ impl<C, S: StateMachine> State<C, S> {
         matches!(self, Self::Leader { .. })
     }
 
-    pub(crate) fn respond(
-        &self,
-        req: <S as StateMachine>::Request,
-    ) -> Option<<S as StateMachine>::Response> {
-        self.v().state_machine.respond(req)
-    }
-
-    pub(crate) fn v(&self) -> &Volatile<S> {
+    pub(crate) fn v(&self) -> &Volatile {
         match self {
             State::Follower { v, .. } | State::Candidate { v, .. } | State::Leader { v, .. } => v,
             State::Transitioning => unreachable!("in transition"),
         }
     }
 
-    pub(crate) fn v_mut(&mut self) -> &mut Volatile<S> {
+    pub(crate) fn v_mut(&mut self) -> &mut Volatile {
         match self {
             State::Follower { v, .. } | State::Candidate { v, .. } | State::Leader { v, .. } => v,
             State::Transitioning => unreachable!("in transition"),
         }
     }
 
-    pub(crate) fn p(&self) -> &Persistent<C> {
+    pub(crate) fn p(&self) -> &Persistent<S::Command> {
         match self {
             State::Follower { p, .. } | State::Candidate { p, .. } | State::Leader { p, .. } => p,
             State::Transitioning => unreachable!("in transition"),
         }
     }
 
-    pub(crate) fn p_mut(&mut self) -> &mut Persistent<C> {
+    pub(crate) fn p_mut(&mut self) -> &mut Persistent<S::Command> {
         match self {
             State::Follower { p, .. } | State::Candidate { p, .. } | State::Leader { p, .. } => p,
             State::Transitioning => unreachable!("in transition"),

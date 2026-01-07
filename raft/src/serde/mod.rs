@@ -36,8 +36,8 @@ impl<C: Deserialize> Deserialize for Log<C> {
 impl<C: Serialize> Serialize for LogEntry<C> {
     fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
         Ok(JSONValue::Object(HashMap::from([
-            ("cmd".to_string(), self.cmd.serialize()?),
-            ("term".to_string(), self.term.serialize()?),
+            ("c".to_string(), self.cmd.serialize()?),
+            ("t".to_string(), self.term.serialize()?),
         ])))
     }
 }
@@ -45,7 +45,7 @@ impl<C: Serialize> Serialize for LogEntry<C> {
 impl<C: Deserialize> Deserialize for LogEntry<C> {
     fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
         if let JSONValue::Object(mut map) = value {
-            match (map.remove("cmd"), map.remove("term")) {
+            match (map.remove("c"), map.remove("t")) {
                 (Some(cmd), Some(term)) => Ok(Self {
                     cmd: Deserialize::deserialize(cmd)?,
                     term: Deserialize::deserialize(term)?,

@@ -108,38 +108,52 @@ impl<C> RaftMessage<C> {
 pub enum ClientMessage<K, V> {
     ReadRequest {
         key: K,
-        message_id: MessageId,
+        id: MessageId,
     },
     WriteRequest {
         key: K,
         value: V,
-        message_id: MessageId,
+        id: MessageId,
     },
     CASRequest {
         key: K,
         from: V,
         to: V,
-        message_id: MessageId,
+        id: MessageId,
     },
     ReadResponse {
         in_reply_to: MessageId,
         value: V,
-        message_id: MessageId,
+        id: MessageId,
     },
     WriteResponse {
         in_reply_to: MessageId,
-        message_id: MessageId,
+        id: MessageId,
     },
     CASResponse {
         in_reply_to: MessageId,
-        message_id: MessageId,
+        id: MessageId,
     },
     ErrorResponse {
         in_reply_to: MessageId,
-        message_id: MessageId,
+        id: MessageId,
         code: u64,
         text: String,
     },
+}
+
+impl<K, V> ClientMessage<K, V> {
+    pub fn id(&self) -> MessageId {
+        match self {
+            ClientMessage::ReadRequest { id, .. }
+            | ClientMessage::WriteRequest { id, .. }
+            | ClientMessage::CASRequest { id, .. }
+            | ClientMessage::ReadResponse { id, .. }
+            | ClientMessage::WriteResponse { id, .. }
+            | ClientMessage::CASResponse { id, .. }
+            | ClientMessage::ErrorResponse { id, .. } => *id,
+        }
+    }
 }
 
 impl<C: Serialize> Serialize for RaftMessage<C> {
@@ -276,68 +290,53 @@ impl<K: Serialize, V: Serialize> Serialize for ClientMessage<K, V> {
         let mut map: HashMap<String, JSONValue> = HashMap::new();
 
         match self {
-            Self::ReadRequest { key, message_id } => {
+            Self::ReadRequest { key, id } => {
                 map.insert("type".into(), "read".serialize()?);
                 map.insert("key".into(), key.serialize()?);
-                map.insert("msg_id".into(), message_id.serialize()?);
+                map.insert("msg_id".into(), id.serialize()?);
             }
-            Self::WriteRequest {
-                key,
-                value,
-                message_id,
-            } => {
+            Self::WriteRequest { key, value, id } => {
                 map.insert("type".into(), "write".serialize()?);
                 map.insert("key".into(), key.serialize()?);
                 map.insert("value".into(), value.serialize()?);
-                map.insert("msg_id".into(), message_id.serialize()?);
+                map.insert("msg_id".into(), id.serialize()?);
             }
-            Self::CASRequest {
-                key,
-                from,
-                to,
-                message_id,
-            } => {
+            Self::CASRequest { key, from, to, id } => {
                 map.insert("type".into(), "cas".serialize()?);
                 map.insert("key".into(), key.serialize()?);
                 map.insert("from".into(), from.serialize()?);
                 map.insert("to".into(), to.serialize()?);
-                map.insert("msg_id".into(), message_id.serialize()?);
+                map.insert("msg_id".into(), id.serialize()?);
             }
             Self::ReadResponse {
                 in_reply_to,
                 value,
-                message_id,
+                id,
             } => {
                 map.insert("type".into(), "read_ok".serialize()?);
                 map.insert("in_reply_to".into(), in_reply_to.serialize()?);
                 map.insert("value".into(), value.serialize()?);
-                map.insert("msg_id".into(), message_id.serialize()?);
+                map.insert("msg_id".into(), id.serialize()?);
             }
-            Self::WriteResponse {
-                in_reply_to,
-                message_id,
-            } => {
+            Self::WriteResponse { in_reply_to, id } => {
                 map.insert("type".into(), "write_ok".serialize()?);
                 map.insert("in_reply_to".into(), in_reply_to.serialize()?);
-                map.insert("msg_id".into(), message_id.serialize()?);
+                map.insert("msg_id".into(), id.serialize()?);
             }
-            Self::CASResponse {
-                in_reply_to,
-                message_id,
-            } => {
+            Self::CASResponse { in_reply_to, id } => {
                 map.insert("type".into(), "cas_ok".serialize()?);
                 map.insert("in_reply_to".into(), in_reply_to.serialize()?);
-                map.insert("msg_id".into(), message_id.serialize()?);
+                map.insert("msg_id".into(), id.serialize()?);
             }
             Self::ErrorResponse {
                 in_reply_to,
-                message_id,
+                id,
                 code,
                 text,
             } => {
                 map.insert("type".into(), "error".serialize()?);
                 map.insert("in_reply_to".into(), in_reply_to.serialize()?);
-                map.insert("msg_id".into(), message_id.serialize()?);
+                map.insert("msg_id".into(), id.serialize()?);
                 map.insert("code".into(), code.serialize()?);
                 map.insert("text".into(), text.serialize()?);
             }
@@ -360,7 +359,7 @@ impl<K: Deserialize, V: Deserialize> Deserialize for ClientMessage<K, V> {
                 "read" => match (body.remove("key"), body.remove("msg_id")) {
                     (Some(key), Some(message_id)) => Ok(Self::ReadRequest {
                         key: Deserialize::deserialize(key)?,
-                        message_id: Deserialize::deserialize(message_id)?,
+                        id: Deserialize::deserialize(message_id)?,
                     }),
                     _ => Err(json::serde::DeserializeError::InvalidValue(
                         JSONValue::Object(body),
@@ -374,7 +373,7 @@ impl<K: Deserialize, V: Deserialize> Deserialize for ClientMessage<K, V> {
                     (Some(key), Some(value), Some(message_id)) => Ok(Self::WriteRequest {
                         key: Deserialize::deserialize(key)?,
                         value: Deserialize::deserialize(value)?,
-                        message_id: Deserialize::deserialize(message_id)?,
+                        id: Deserialize::deserialize(message_id)?,
                     }),
                     _ => Err(json::serde::DeserializeError::InvalidValue(
                         JSONValue::Object(body),
@@ -390,7 +389,7 @@ impl<K: Deserialize, V: Deserialize> Deserialize for ClientMessage<K, V> {
                         key: Deserialize::deserialize(key)?,
                         from: Deserialize::deserialize(from)?,
                         to: Deserialize::deserialize(to)?,
-                        message_id: Deserialize::deserialize(message_id)?,
+                        id: Deserialize::deserialize(message_id)?,
                     }),
                     _ => Err(json::serde::DeserializeError::InvalidValue(
                         JSONValue::Object(body),
@@ -404,7 +403,7 @@ impl<K: Deserialize, V: Deserialize> Deserialize for ClientMessage<K, V> {
                     (Some(in_reply_to), Some(value), Some(message_id)) => Ok(Self::ReadResponse {
                         in_reply_to: Deserialize::deserialize(in_reply_to)?,
                         value: Deserialize::deserialize(value)?,
-                        message_id: Deserialize::deserialize(message_id)?,
+                        id: Deserialize::deserialize(message_id)?,
                     }),
                     _ => Err(json::serde::DeserializeError::InvalidValue(
                         JSONValue::Object(body),
@@ -413,7 +412,7 @@ impl<K: Deserialize, V: Deserialize> Deserialize for ClientMessage<K, V> {
                 "write_ok" => match (body.remove("in_reply_to"), body.remove("msg_id")) {
                     (Some(in_reply_to), Some(message_id)) => Ok(Self::WriteResponse {
                         in_reply_to: Deserialize::deserialize(in_reply_to)?,
-                        message_id: Deserialize::deserialize(message_id)?,
+                        id: Deserialize::deserialize(message_id)?,
                     }),
                     _ => Err(json::serde::DeserializeError::InvalidValue(
                         JSONValue::Object(body),
@@ -422,7 +421,7 @@ impl<K: Deserialize, V: Deserialize> Deserialize for ClientMessage<K, V> {
                 "cas_ok" => match (body.remove("in_reply_to"), body.remove("msg_id")) {
                     (Some(in_reply_to), Some(message_id)) => Ok(Self::CASResponse {
                         in_reply_to: Deserialize::deserialize(in_reply_to)?,
-                        message_id: Deserialize::deserialize(message_id)?,
+                        id: Deserialize::deserialize(message_id)?,
                     }),
                     _ => Err(json::serde::DeserializeError::InvalidValue(
                         JSONValue::Object(body),
@@ -437,7 +436,7 @@ impl<K: Deserialize, V: Deserialize> Deserialize for ClientMessage<K, V> {
                     (Some(in_reply_to), Some(message_id), Some(code), Some(text)) => {
                         Ok(Self::ErrorResponse {
                             in_reply_to: Deserialize::deserialize(in_reply_to)?,
-                            message_id: Deserialize::deserialize(message_id)?,
+                            id: Deserialize::deserialize(message_id)?,
                             code: Deserialize::deserialize(code)?,
                             text: Deserialize::deserialize(text)?,
                         })
