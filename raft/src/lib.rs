@@ -325,8 +325,8 @@ where
             .expect("should never run out of IDs")
             .get();
 
-        let resp = match cmd.op {
-            Operation::Read { key } => {
+        let resp = match cmd.inner {
+            WireCommand::Read { key } => {
                 if let Some(v) = self.get(&key) {
                     rpc::ClientMessage::ReadResponse {
                         in_reply_to,
@@ -342,11 +342,11 @@ where
                     }
                 }
             }
-            Operation::Write { key, value } => {
+            WireCommand::Write { key, value } => {
                 self.insert(key, value);
                 rpc::ClientMessage::WriteResponse { in_reply_to, id }
             }
-            Operation::CAS { key, from, to } => match self.get_mut(&key) {
+            WireCommand::CAS { key, from, to } => match self.get_mut(&key) {
                 Some(v) if *v == from => {
                     *v = to;
 
@@ -374,7 +374,7 @@ where
 
 #[derive(Debug, Clone)]
 pub struct Command<K, V> {
-    op: Operation<K, V>,
+    inner: WireCommand<K, V>,
 
     /// Below are optional, as they do not exist on the wire and when deserializing
     /// state (which contains the [`state::Log`] and thus commands) from disk. Restoring
@@ -401,19 +401,19 @@ impl<K, V>
     ) -> Self {
         match msg {
             ClientMessage::ReadRequest { key, id } => Self {
-                op: Operation::Read { key },
+                inner: WireCommand::Read { key },
                 in_reply_to: Some(id),
                 client: Some(client),
                 respond: Some(chan),
             },
             ClientMessage::WriteRequest { key, value, id } => Self {
-                op: Operation::Write { key, value },
+                inner: WireCommand::Write { key, value },
                 in_reply_to: Some(id),
                 client: Some(client),
                 respond: Some(chan),
             },
             ClientMessage::CASRequest { key, from, to, id } => Self {
-                op: Operation::CAS { key, from, to },
+                inner: WireCommand::CAS { key, from, to },
                 in_reply_to: Some(id),
                 client: Some(client),
                 respond: Some(chan),
@@ -430,7 +430,7 @@ impl<K, V>
 
 impl<K: Serialize, V: Serialize> Serialize for Command<K, V> {
     fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
-        self.op.serialize()
+        self.inner.serialize()
     }
 }
 
@@ -438,7 +438,7 @@ impl<K: Deserialize, V: Deserialize> Deserialize for Command<K, V> {
     fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
         let op = Deserialize::deserialize(value)?;
         Ok(Self {
-            op,
+            inner: op,
             in_reply_to: None,
             client: None,
             respond: None,
@@ -447,27 +447,27 @@ impl<K: Deserialize, V: Deserialize> Deserialize for Command<K, V> {
 }
 
 #[derive(Debug, Clone)]
-pub enum Operation<K, V> {
+pub enum WireCommand<K, V> {
     Read { key: K },
     Write { key: K, value: V },
     CAS { key: K, from: V, to: V },
 }
 
-impl<K: Serialize, V: Serialize> Serialize for Operation<K, V> {
+impl<K: Serialize, V: Serialize> Serialize for WireCommand<K, V> {
     fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
         let mut map = HashMap::new();
 
         match self {
-            Operation::Read { key } => {
+            WireCommand::Read { key } => {
                 map.insert("t".into(), "r".serialize()?);
                 map.insert("k".into(), key.serialize()?);
             }
-            Operation::Write { key, value } => {
+            WireCommand::Write { key, value } => {
                 map.insert("t".into(), "w".serialize()?);
                 map.insert("k".into(), key.serialize()?);
                 map.insert("v".into(), value.serialize()?);
             }
-            Operation::CAS { key, from, to } => {
+            WireCommand::CAS { key, from, to } => {
                 map.insert("t".into(), "c".serialize()?);
                 map.insert("k".into(), key.serialize()?);
                 map.insert("f".into(), from.serialize()?);
@@ -479,7 +479,7 @@ impl<K: Serialize, V: Serialize> Serialize for Operation<K, V> {
     }
 }
 
-impl<K: Deserialize, V: Deserialize> Deserialize for Operation<K, V> {
+impl<K: Deserialize, V: Deserialize> Deserialize for WireCommand<K, V> {
     fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
         if let JSONValue::Object(mut map) = value {
             let Some(JSONValue::String(typ)) = map.remove("t") else {
