@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Read;
+use std::num::NonZero;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -22,18 +23,34 @@ pub mod state;
 /// Identifier for nodes in the cluster.
 type NodeID = String;
 
+/// Index of log entries. Raft is 1-indexed.
+pub(crate) type LogIndex = NonZero<u64>;
+
 /// Timeout for elections.
 ///
 /// If we do not receive communications within this period, assume there is no leader.
 const ELECTION_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Interval at which heartbeats (empty AppendEntries RPCs) are emitted, if no regular
+/// AppendEntries are emitted.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Minimum time between log replications emitted from leaders.
+///
+/// Client requests and leadership promotion can trigger opportunistic, immediate
+/// replication events; this interval rate limits those events.
 const MIN_REPLICATION_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Interval at which application of log entries to the state machine occurs, one at a
+/// time.
+const APPLICATION_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct Engine<S: StateMachine> {
     /// Underlying raft state.
     state: Arc<Mutex<State<S>>>,
+    /// State machine holding current application state.
+    state_machine: S,
 }
 
 impl<S> Engine<S>
@@ -46,29 +63,35 @@ where
     /// restored.
     pub fn new_from_src(
         id: NodeID,
-        cluster_ids: Vec<NodeID>,
+        node_ids: Vec<NodeID>,
         persistence_source: &mut impl Read,
     ) -> Result<Self, PersistenceError> {
         let state = Persistent::<S::Command>::restore(persistence_source)?;
-        Ok(Self::new(id, cluster_ids, state))
+        Ok(Self::new(id, node_ids, state))
     }
 
     /// Create a new Raft engine.
     ///
     /// Does not do anything by itself; call [`Self::start`] afterwards.
-    pub fn new(id: NodeID, cluster_ids: Vec<NodeID>, state: Persistent<S::Command>) -> Self {
+    pub fn new(id: NodeID, node_ids: Vec<NodeID>, state: Persistent<S::Command>) -> Self {
         assert!(
-            !cluster_ids.contains(&id),
+            !node_ids.contains(&id),
             "cluster IDs should not contain self"
         );
 
-        let state = Arc::new(Mutex::new(State::new(id, cluster_ids, state)));
-        Self { state }
+        let state = Arc::new(Mutex::new(State::new(id, node_ids, state)));
+        Self {
+            state,
+            // State is built up from log on each log; start with a fresh machine.
+            state_machine: Default::default(),
+        }
     }
 
     /// Launch the Raft engine.
+    ///
+    /// Takes ownership, as a given engine can only be started once.
     pub fn start<K, V>(
-        &self,
+        self,
         raft_rx: Receiver<(NodeID, rpc::RaftMessage<S::Command>)>,
         raft_tx: Sender<(NodeID, rpc::RaftMessage<S::Command>)>,
         client_rx: Receiver<(NodeID, rpc::ClientMessage<K, V>)>,
@@ -140,6 +163,26 @@ where
             })
             .expect("thread creation should always succeed");
 
+        // Periodic state application
+        thread::Builder::new()
+            .name("raft-state-application-loop".into())
+            .spawn({
+                let state = Arc::clone(&self.state);
+                let mut machine = self.state_machine;
+
+                move || {
+                    // Sleep a bit first, as initially there's not going to be any
+                    // entries to apply (commit index needs to be built up first).
+                    thread::sleep(ELECTION_TIMEOUT);
+
+                    loop {
+                        state.lock().expect("no poison").apply(&mut machine);
+                        thread::sleep(APPLICATION_INTERVAL);
+                    }
+                }
+            })
+            .expect("thread creation should always succeed");
+
         // Handle incoming Raft messages
         thread::Builder::new()
             .name("raft-handle-incoming-raft-msgs".into())
@@ -155,6 +198,9 @@ where
                             .lock()
                             .expect("no poison")
                             .maybe_step_down(remote_term);
+
+                        // Even if we stepped down to follower, still reply as reply is
+                        // useful (e.g. to vote for an eligible peer).
 
                         match msg {
                             rpc::RaftMessage::RequestVote {
@@ -175,23 +221,43 @@ where
                             rpc::RaftMessage::RequestVoteResponse { term, vote_granted } => state
                                 .lock()
                                 .expect("no poison")
-                                .handle_vote_response(peer, term, vote_granted),
+                                .handle_vote_response(peer, term, vote_granted, raft_tx.clone()),
                             rpc::RaftMessage::AppendEntries {
-                                leader_term: _,
-                                prev_log_index: _,
-                                prev_log_term: _,
-                                entries: _,
-                                leader_commit: _,
+                                term,
+                                commit_index,
+                                prev_log_index,
+                                prev_log_term,
+                                entries,
                             } => {
-                                // TODO: business logic.
-                                eprintln!("handling append entries from {}", peer);
+                                eprintln!(
+                                    "handling append entries from {} on term {} for {} entries",
+                                    peer,
+                                    term,
+                                    entries.inner.len()
+                                );
 
-                                state.lock().expect("no poison").become_follower();
+                                let resp = state.lock().expect("no poison").handle_append_entries(
+                                    term,
+                                    commit_index,
+                                    prev_log_index,
+                                    prev_log_term,
+                                    entries,
+                                );
+                                raft_tx
+                                    .send((peer, resp))
+                                    .expect("raft message receiver should never hang up");
                             }
-                            rpc::RaftMessage::AppendEntriesResponse {
-                                current_term: _,
-                                success: _,
-                            } => unimplemented!("append entries response"),
+                            rpc::RaftMessage::AppendEntriesResponse { index, success, .. } => {
+                                state
+                                    .lock()
+                                    .expect("no poison")
+                                    .handle_append_entries_response(
+                                        peer,
+                                        success,
+                                        index,
+                                        raft_tx.clone(),
+                                    );
+                            }
                         };
                     }
 
@@ -304,7 +370,7 @@ where
 impl<K, V> StateMachine for HashMap<K, V>
 where
     K: Eq + std::hash::Hash,
-    K: Send + Debug,
+    K: Send + Debug + Clone,
     V: Send + Debug + Clone + PartialEq,
 {
     type Command = Command<K, V>;
@@ -328,12 +394,16 @@ where
         let resp = match cmd.inner {
             WireCommand::Read { key } => {
                 if let Some(v) = self.get(&key) {
+                    eprintln!("applying to state machine: read {key:?}");
+
                     rpc::ClientMessage::ReadResponse {
                         in_reply_to,
                         value: v.clone(),
                         id,
                     }
                 } else {
+                    eprintln!("applying to state machine: read {key:?}: no such key");
+
                     rpc::ClientMessage::ErrorResponse {
                         in_reply_to,
                         id,
@@ -343,27 +413,37 @@ where
                 }
             }
             WireCommand::Write { key, value } => {
+                eprintln!("applying to state machine: write {key:?} <- {value:?}");
                 self.insert(key, value);
                 rpc::ClientMessage::WriteResponse { in_reply_to, id }
             }
             WireCommand::CAS { key, from, to } => match self.get_mut(&key) {
                 Some(v) if *v == from => {
+                    eprintln!("applying to state machine: CAS {key:?}: {from:?} -> {to:?}");
                     *v = to;
 
                     rpc::ClientMessage::CASResponse { in_reply_to, id }
                 }
-                Some(v) => rpc::ClientMessage::ErrorResponse {
-                    in_reply_to,
-                    id,
-                    code: ReservedErrorCode::PreconditionFailed.into(),
-                    text: format!("values for key differ (found {:?})", v),
-                },
-                None => rpc::ClientMessage::ErrorResponse {
-                    in_reply_to,
-                    id,
-                    code: ReservedErrorCode::KeyDoesNotExist.into(),
-                    text: "no such key".into(),
-                },
+                Some(v) => {
+                    eprintln!("applying to state machine: CAS {key:?}: {from:?}: conflict");
+
+                    rpc::ClientMessage::ErrorResponse {
+                        in_reply_to,
+                        id,
+                        code: ReservedErrorCode::PreconditionFailed.into(),
+                        text: format!("values for key differ (found {:?})", v),
+                    }
+                }
+                None => {
+                    eprintln!("applying to state machine: CAS {key:?}: no such key");
+
+                    rpc::ClientMessage::ErrorResponse {
+                        in_reply_to,
+                        id,
+                        code: ReservedErrorCode::KeyDoesNotExist.into(),
+                        text: "no such key".into(),
+                    }
+                }
             },
         };
 

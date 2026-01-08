@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use json::Value as JSONValue;
 use json::serde::{Deserialize, Serialize};
 
+use crate::LogIndex;
 use crate::state::{Log, Term};
 
 pub(crate) type MessageId = u64;
@@ -40,38 +41,36 @@ impl<K: Deserialize, V: Deserialize, C: Deserialize> Deserialize for Message<K, 
 }
 
 #[derive(Debug, Clone)]
-pub enum RaftMessage<C> {
+pub enum RaftMessage<Cmd> {
     AppendEntries {
         /// Leader's term
-        leader_term: Term,
+        term: Term,
+        /// Leader's commit index. No commits might have occurred yet.
+        commit_index: Option<LogIndex>,
 
-        /// Index of log entry immediately preceding new ones.
-        prev_log_index: u64,
-        /// Term of previous log index entry.
+        /// Leader's index of log entry immediately preceding new ones.
+        prev_log_index: LogIndex,
+        /// Leader's term of log entry immediately preceding new ones.
         prev_log_term: Term,
 
         /// Log entries to store (empty for heartbeat). May send more than one for
         /// efficiency.
-        entries: Log<C>,
-
-        /// Leader's commit index.
-        leader_commit: u64,
+        entries: Log<Cmd>,
     },
     AppendEntriesResponse {
         /// Current term, for leader to update itself.
         current_term: Term,
-
-        /// True if follower contained entry matching
-        /// [`AppendEntriesRequest::prev_log_index`] and
-        /// [`AppendEntriesRequest::prev_log_term`].
+        /// New index of updated follower log.
+        index: LogIndex,
+        /// True if follower contained entry matching previous log index and previous
+        /// log term.
         success: bool,
     },
     RequestVote {
         /// The requesting candidate's term.
         candidate_term: Term,
-
         /// Index of candidate's last log entry.
-        last_log_index: u64,
+        last_log_index: LogIndex,
         /// Term of candidate's last log entry.
         last_log_term: Term,
     },
@@ -87,9 +86,7 @@ impl<C> RaftMessage<C> {
     /// All message envelopes contain a term. Extract it.
     pub(crate) fn term(&self) -> Term {
         match self {
-            RaftMessage::AppendEntries {
-                leader_term: term, ..
-            }
+            RaftMessage::AppendEntries { term, .. }
             | RaftMessage::AppendEntriesResponse {
                 current_term: term, ..
             }
@@ -162,11 +159,11 @@ impl<C: Serialize> Serialize for RaftMessage<C> {
 
         match self {
             RaftMessage::AppendEntries {
-                leader_term,
+                term: leader_term,
                 prev_log_index,
                 prev_log_term,
                 entries,
-                leader_commit,
+                commit_index: leader_commit,
             } => {
                 map.insert("type".into(), "append_entries".serialize()?);
                 map.insert("leader_term".into(), leader_term.serialize()?);
@@ -177,9 +174,11 @@ impl<C: Serialize> Serialize for RaftMessage<C> {
             }
             RaftMessage::AppendEntriesResponse {
                 current_term,
+                index,
                 success,
             } => {
                 map.insert("type".into(), "append_entries_response".serialize()?);
+                map.insert("index".into(), index.serialize()?);
                 map.insert("current_term".into(), current_term.serialize()?);
                 map.insert("success".into(), success.serialize()?);
             }
@@ -228,22 +227,29 @@ impl<C: Deserialize> Deserialize for RaftMessage<C> {
                         Some(entries),
                         Some(leader_commit),
                     ) => Ok(Self::AppendEntries {
-                        leader_term: Deserialize::deserialize(leader_term)?,
+                        term: Deserialize::deserialize(leader_term)?,
                         prev_log_index: Deserialize::deserialize(prev_log_index)?,
                         prev_log_term: Deserialize::deserialize(prev_log_term)?,
                         entries: Deserialize::deserialize(entries)?,
-                        leader_commit: Deserialize::deserialize(leader_commit)?,
+                        commit_index: Deserialize::deserialize(leader_commit)?,
                     }),
                     _ => Err(json::serde::DeserializeError::InvalidValue(
                         JSONValue::Object(body),
                     )),
                 },
                 "append_entries_response" => {
-                    match (body.remove("current_term"), body.remove("success")) {
-                        (Some(current_term), Some(success)) => Ok(Self::AppendEntriesResponse {
-                            current_term: Deserialize::deserialize(current_term)?,
-                            success: Deserialize::deserialize(success)?,
-                        }),
+                    match (
+                        body.remove("current_term"),
+                        body.remove("index"),
+                        body.remove("success"),
+                    ) {
+                        (Some(current_term), Some(index), Some(success)) => {
+                            Ok(Self::AppendEntriesResponse {
+                                current_term: Deserialize::deserialize(current_term)?,
+                                index: Deserialize::deserialize(index)?,
+                                success: Deserialize::deserialize(success)?,
+                            })
+                        }
                         _ => Err(json::serde::DeserializeError::InvalidValue(
                             JSONValue::Object(body),
                         )),

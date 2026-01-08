@@ -65,6 +65,8 @@ impl Error for DeserializeError {}
 /// and/or [`TryFrom`] etc. on generic stdlib types is error-prone as it can lead to
 /// infinite recursion. Being explicit with our own traits is much simpler and safer.
 pub mod stddlib_impls {
+    use std::num::NonZero;
+
     use super::{Deserialize, Serialize};
     use crate::serde::{DeserializeError, SerializeError};
     use crate::{Number, Value};
@@ -149,6 +151,27 @@ pub mod stddlib_impls {
         fn deserialize(value: Value) -> Result<Self, DeserializeError> {
             if let Value::Number(n) = value {
                 Ok(n.try_into()?)
+            } else {
+                Err(DeserializeError::InvalidValue(value))
+            }
+        }
+    }
+
+    /// [`std::num::ZeroablePrimitive`] is unstable/nightly/internal, so cannot be
+    /// generic here.
+    impl Serialize for NonZero<u64> {
+        fn serialize(&self) -> Result<Value, SerializeError> {
+            self.get().serialize()
+        }
+    }
+
+    impl Deserialize for NonZero<u64> {
+        fn deserialize(value: Value) -> Result<Self, DeserializeError> {
+            if let Value::Number(n) = value {
+                let v: u64 = n.try_into()?;
+                Self::try_from(v).map_err(|_| {
+                    DeserializeError::InvalidValue(Value::Number(Number(v.to_string())))
+                })
             } else {
                 Err(DeserializeError::InvalidValue(value))
             }
