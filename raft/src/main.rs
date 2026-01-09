@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // disk version. Note the command is a "neutral element" of reading a non-existent
     // key, and responding to no client about it.
     let p_bytes =
-        br#"{"current_term": 0, "voted_for": null, "log": [{"c": {"t": "r", "k": 0}, "t": 0}]}"#;
+        br#"{"current_term": 0, "voted_for": null, "log": [{"c": {"T": "r", "k": 0}, "t": 0}]}"#;
     let p = Persistent::restore(&mut p_bytes.as_slice())?;
 
     let (raft_incoming_tx, raft_incoming_rx) = mpsc::channel();

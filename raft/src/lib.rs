@@ -38,12 +38,9 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// Minimum time between log replications emitted from leaders.
 ///
 /// Client requests and leadership promotion can trigger opportunistic, immediate
-/// replication events; this interval rate limits those events.
+/// replication events; this interval rate limits those events, allowing batching for
+/// better network utilization (1 RPC with N messages over N RPCs with 1 message each).
 const MIN_REPLICATION_INTERVAL: Duration = Duration::from_millis(10);
-
-/// Interval at which application of log entries to the state machine occurs, one at a
-/// time.
-const APPLICATION_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct Engine<S: StateMachine> {
@@ -163,32 +160,15 @@ where
             })
             .expect("thread creation should always succeed");
 
-        // Periodic state application
-        thread::Builder::new()
-            .name("raft-state-application-loop".into())
-            .spawn({
-                let state = Arc::clone(&self.state);
-                let mut machine = self.state_machine;
-
-                move || {
-                    // Sleep a bit first, as initially there's not going to be any
-                    // entries to apply (commit index needs to be built up first).
-                    thread::sleep(ELECTION_TIMEOUT);
-
-                    loop {
-                        state.lock().expect("no poison").apply(&mut machine);
-                        thread::sleep(APPLICATION_INTERVAL);
-                    }
-                }
-            })
-            .expect("thread creation should always succeed");
-
         // Handle incoming Raft messages
         thread::Builder::new()
             .name("raft-handle-incoming-raft-msgs".into())
             .spawn({
                 let state = Arc::clone(&self.state);
                 let raft_tx = raft_tx.clone();
+
+                // This thread is responsible for driving the state machine forward.
+                let mut machine = self.state_machine;
 
                 move || {
                     for (peer, msg) in raft_rx.iter() {
@@ -237,11 +217,13 @@ where
                                 );
 
                                 let resp = state.lock().expect("no poison").handle_append_entries(
+                                    peer.clone(),
                                     term,
                                     commit_index,
                                     prev_log_index,
                                     prev_log_term,
                                     entries,
+                                    &mut machine,
                                 );
                                 raft_tx
                                     .send((peer, resp))
@@ -256,6 +238,7 @@ where
                                         success,
                                         index,
                                         raft_tx.clone(),
+                                        &mut machine,
                                     );
                             }
                         };
@@ -272,24 +255,38 @@ where
             .spawn({
                 let state = Arc::clone(&self.state);
                 let client_tx = client_tx.clone();
-                let raft_tx = raft_tx.clone();
 
                 move || {
                     for (client, msg) in client_rx.iter() {
                         // This check is pessimistic; it's safe to reject requests if
                         // we're not the leader. It is NOT safe to reply if just this
                         // check passes, without also confirming reads from quorum.
-                        //
-                        // TODO: proxy to leader.
-                        if !state.lock().expect("no poison").is_leader() {
-                            let resp = rpc::ClientMessage::ErrorResponse {
-                                in_reply_to: msg.id(),
-                                id: msg_id_gen
-                                    .next()
-                                    .expect("should never run out of IDs")
-                                    .get(),
-                                code: ReservedErrorCode::TemporarilyUnavailable.into(),
-                                text: "not a leader".into(),
+                        let is_leader = state.lock().expect("no poison").is_leader();
+
+                        if !is_leader {
+                            let resp = if let Some(leader) =
+                                state.lock().expect("no poison").current_leader()
+                            {
+                                // TODO: proxy to leader.
+                                rpc::ClientMessage::ErrorResponse {
+                                    in_reply_to: msg.id(),
+                                    id: msg_id_gen
+                                        .next()
+                                        .expect("should never run out of IDs")
+                                        .get(),
+                                    code: ReservedErrorCode::TemporarilyUnavailable.into(),
+                                    text: format!("not a leader, current leader {leader}"),
+                                }
+                            } else {
+                                rpc::ClientMessage::ErrorResponse {
+                                    in_reply_to: msg.id(),
+                                    id: msg_id_gen
+                                        .next()
+                                        .expect("should never run out of IDs")
+                                        .get(),
+                                    code: ReservedErrorCode::TemporarilyUnavailable.into(),
+                                    text: "not a leader and current leader unknown".into(),
+                                }
                             };
 
                             client_tx
@@ -300,56 +297,16 @@ where
                         };
 
                         match msg {
-                            rpc::ClientMessage::ReadRequest { key: _, id, .. } => client_tx
-                                .send((
-                                    client,
-                                    rpc::ClientMessage::ErrorResponse {
-                                        in_reply_to: id,
-                                        id: msg_id_gen
-                                            .next()
-                                            .expect("should never run out of IDs")
-                                            .get(),
-                                        code: ReservedErrorCode::KeyDoesNotExist.into(),
-                                        text: "no such key".into(),
-                                    },
-                                ))
-                                .expect("client receiver should never hang up"),
-                            msg @ rpc::ClientMessage::WriteRequest { id: _, .. } => {
+                            rpc::ClientMessage::WriteRequest { .. }
+                            | ClientMessage::ReadRequest { .. }
+                            | ClientMessage::CASRequest { .. } => {
+                                // Client request goes into log (in a more efficient
+                                // format than raw RPC requests), carrying a callback
+                                // channel on which the client response is sent once the
+                                // state machine applies the command, implying
+                                // replication is reached and responding is safe.
                                 let cmd: S::Command = (client, msg, client_tx.clone()).into();
                                 state.lock().expect("no poison").append(cmd);
-
-                                // Opportunistically replicate immediately, in addition
-                                // to the replication loop.
-                                state
-                                    .lock()
-                                    .expect("no poison")
-                                    .replicate_log(raft_tx.clone());
-
-                                // ClientMessage::ErrorResponse {
-                                //     in_reply_to: id,
-                                //     id: msg_id_gen
-                                //         .next()
-                                //         .expect("should never run out of IDs")
-                                //         .get(),
-                                //     code: ReservedErrorCode::NotSupported.into(),
-                                //     text: "writes not supported yet".into(),
-                                // }
-                            }
-                            rpc::ClientMessage::CASRequest { id, .. } => {
-                                client_tx
-                                    .send((
-                                        client,
-                                        ClientMessage::ErrorResponse {
-                                            in_reply_to: id,
-                                            id: msg_id_gen
-                                                .next()
-                                                .expect("should never run out of IDs")
-                                                .get(),
-                                            code: ReservedErrorCode::NotSupported.into(),
-                                            text: "cas not supported yet".into(),
-                                        },
-                                    ))
-                                    .expect("client receiver should never hang up");
                             }
                             rpc::ClientMessage::ReadResponse { .. }
                             | rpc::ClientMessage::WriteResponse { .. }
@@ -376,15 +333,9 @@ where
     type Command = Command<K, V>;
 
     fn apply(&mut self, cmd: Self::Command) {
-        let client = cmd
-            .client
-            .expect("should never try to apply invalidated log entry");
-        let chan = cmd
-            .respond
-            .expect("should never try to apply invalidated log entry");
-        let in_reply_to = cmd
-            .in_reply_to
-            .expect("should never try to apply invalidated log entry");
+        // If not set, use a bogus default: we will not end up sending this on the wire
+        // anyway.
+        let in_reply_to = cmd.in_reply_to.unwrap_or_default();
 
         let id = NodeMessageIdGenerator
             .next()
@@ -447,8 +398,16 @@ where
             },
         };
 
-        chan.send((client, resp))
-            .expect("client response receiver should never hang up");
+        if let (Some(client), Some(chan)) = (cmd.client, cmd.respond) {
+            chan.send((client, resp))
+                .expect("client response receiver should never hang up");
+        } else {
+            // This can happen when deserializing the log fresh from disk, at which
+            // point neither does an in-memory concept like "channel" exist, nor do we
+            // need one: there is no client listening anymore (or if it is it will have
+            // to retry -- we just crashed and rebooted!).
+            eprintln!("applying to state machine: no response channel set")
+        }
     }
 }
 
@@ -456,10 +415,13 @@ where
 pub struct Command<K, V> {
     inner: WireCommand<K, V>,
 
-    /// Below are optional, as they do not exist on the wire and when deserializing
-    /// state (which contains the [`state::Log`] and thus commands) from disk. Restoring
-    /// from disk implies a node booting, thus crashed, thus there's no way to respond
-    /// to clients anymore anyway! The below are pure in-memory concepts.
+    /// Below are Options as they do not exist on the wire and when deserializing state
+    /// (which contains the [`state::Log`] and thus commands) from disk.
+    ///
+    /// Restoring from disk implies a node booting, thus crashed, thus there's no way to
+    /// respond to clients anymore anyway. Clients need to retry.
+    ///
+    /// The below are pure in-memory concepts.
     in_reply_to: Option<MessageId>,
     client: Option<NodeID>,
     respond: Option<Sender<(String, rpc::ClientMessage<K, V>)>>,
@@ -537,18 +499,22 @@ impl<K: Serialize, V: Serialize> Serialize for WireCommand<K, V> {
     fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
         let mut map = HashMap::new();
 
+        // Keep key names short for efficiency (or more like simulating what that could
+        // look like... we're using JSON so it's not like we care about it. In any case
+        // this justifies why a dedicated wire type exists; imagine this could also be a
+        // binary format).
         match self {
             WireCommand::Read { key } => {
-                map.insert("t".into(), "r".serialize()?);
+                map.insert("T".into(), "r".serialize()?);
                 map.insert("k".into(), key.serialize()?);
             }
             WireCommand::Write { key, value } => {
-                map.insert("t".into(), "w".serialize()?);
+                map.insert("T".into(), "w".serialize()?);
                 map.insert("k".into(), key.serialize()?);
                 map.insert("v".into(), value.serialize()?);
             }
             WireCommand::CAS { key, from, to } => {
-                map.insert("t".into(), "c".serialize()?);
+                map.insert("T".into(), "c".serialize()?);
                 map.insert("k".into(), key.serialize()?);
                 map.insert("f".into(), from.serialize()?);
                 map.insert("t".into(), to.serialize()?);
@@ -562,7 +528,7 @@ impl<K: Serialize, V: Serialize> Serialize for WireCommand<K, V> {
 impl<K: Deserialize, V: Deserialize> Deserialize for WireCommand<K, V> {
     fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
         if let JSONValue::Object(mut map) = value {
-            let Some(JSONValue::String(typ)) = map.remove("t") else {
+            let Some(JSONValue::String(typ)) = map.remove("T") else {
                 return Err(json::serde::DeserializeError::InvalidValue(
                     JSONValue::Object(map),
                 ));
