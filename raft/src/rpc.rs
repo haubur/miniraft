@@ -73,6 +73,9 @@ pub enum RaftMessage<Cmd> {
         /// log term.
         success: bool,
     },
+    /// Note, from Figure 2 in paper this RPC contains the candidate ID as well, but
+    /// that is handled by an upper layer message envelope. Including it would just
+    /// allow invalid states (the two IDs disagreeing).
     RequestVote {
         /// The requesting candidate's term.
         candidate_term: Term,
