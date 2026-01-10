@@ -10,9 +10,9 @@ use std::time::Duration;
 use json::Value as JSONValue;
 use json::serde::{Deserialize, Serialize};
 
-use crate::maelstrom::NodeMessageIdGenerator;
+use crate::maelstrom::NodeMessageID;
 use crate::maelstrom::rpc::ReservedErrorCode;
-use crate::rpc::{ClientMessage, MessageId};
+use crate::rpc::{ClientMessage, MessageID};
 use crate::state::{PersistenceError, Persistent, State, StateMachine};
 
 pub mod maelstrom;
@@ -25,6 +25,11 @@ type NodeID = String;
 
 /// Index of log entries. Raft is 1-indexed.
 pub(crate) type LogIndex = NonZero<u64>;
+
+/// A pairing of node ID (client or Raft peer) and some message.
+type PeerMessage<M> = (NodeID, M);
+type PeerReceiver<M> = Receiver<PeerMessage<M>>;
+type PeerSender<M> = Sender<PeerMessage<M>>;
 
 /// Timeout for elections.
 ///
@@ -42,6 +47,15 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// better network utilization (1 RPC with N messages over N RPCs with 1 message each).
 const MIN_REPLICATION_INTERVAL: Duration = Duration::from_millis(10);
 
+/// The engine driving core Raft state, and holding application state in the Raft state
+/// machine.
+///
+/// Responsibilities are:
+///
+/// - receive client and Raft peer requests and route to Raft core
+/// - translate between client domain (key-value store) and Raft core (generic),
+///   including for state machine driving
+/// - route Raft responses back to peers and clients
 #[derive(Debug, Clone)]
 pub struct Engine<S: StateMachine> {
     /// Underlying raft state.
@@ -52,9 +66,10 @@ pub struct Engine<S: StateMachine> {
 
 impl<S> Engine<S>
 where
-    S::Command: Deserialize + Debug,
-    S::Command: Send + Sync + 'static,
     S: StateMachine + 'static,
+    S::Command: Debug,
+    S::Command: Deserialize,           // for reading wire messages
+    S::Command: Send + Sync + 'static, // for threading
 {
     /// Create a new Raft engine from a reader, from which persisted state will be
     /// restored.
@@ -86,242 +101,287 @@ where
 
     /// Launch the Raft engine.
     ///
+    /// It specifically accepts client RPC calls for key-value store operations.
+    ///
     /// Takes ownership, as a given engine can only be started once.
-    pub fn start<K, V>(
+    ///
+    /// While running, it accepts client- and Raft-specific messages, and will respond
+    /// on the corresponding outgoing channels. It will also put newly created,
+    /// non-response messages on the outgoing channels any time it needs.
+    pub fn start<K, V, I>(
         self,
-        raft_rx: Receiver<(NodeID, rpc::RaftMessage<S::Command>)>,
-        raft_tx: Sender<(NodeID, rpc::RaftMessage<S::Command>)>,
-        client_rx: Receiver<(NodeID, rpc::ClientMessage<K, V>)>,
-        client_tx: Sender<(NodeID, rpc::ClientMessage<K, V>)>,
-        mut msg_id_gen: NodeMessageIdGenerator,
+        raft_rx: PeerReceiver<rpc::RaftMessage<S::Command>>,
+        raft_tx: PeerSender<rpc::RaftMessage<S::Command>>,
+        client_rx: PeerReceiver<rpc::ClientMessage<K, V>>,
+        client_tx: PeerSender<rpc::ClientMessage<K, V>>,
+        message_ids: I,
     ) where
-        K: Send + 'static + Debug,
-        V: Send + 'static + Debug,
-        S::Command: Clone,
+        K: Send + 'static + Debug, // for threading
+        V: Send + 'static + Debug, // for threading
+        S::Command: Clone,         // for applying from log to state machine
         S::Command: From<(
+            // for creating state machine commands from incoming messages + a callback
+            // channel for responses
             NodeID,
+            NodeMessageID,
             rpc::ClientMessage<K, V>,
-            Sender<(String, ClientMessage<K, V>)>,
+            PeerSender<ClientMessage<K, V>>,
+        )>,
+        I: Iterator<Item = NodeMessageID> + Send + 'static,
+    {
+        launch_named_background_task("raft-election-loop", {
+            let state = Arc::clone(&self.state);
+            let raft_tx = raft_tx.clone();
+            move || Self::election_loop(raft_tx, state)
+        });
+
+        launch_named_background_task("raft-log-replication-loop", {
+            let state = Arc::clone(&self.state);
+            let raft_tx = raft_tx.clone();
+            move || Self::log_replication_loop(raft_tx, state)
+        });
+
+        launch_named_background_task("raft-handle-incoming-raft-messages", {
+            let state = Arc::clone(&self.state);
+            let raft_tx = raft_tx.clone();
+            // This task is also responsible for driving the state machine forward.
+            let mut machine = self.state_machine; // move out + make mutable
+            move || Self::incoming_raft_rpcs_loop(raft_rx, raft_tx, state, &mut machine)
+        });
+
+        launch_named_background_task("raft-handle-incoming-client-messages", {
+            let state = Arc::clone(&self.state);
+            let client_tx = client_tx.clone();
+            move || Self::incoming_client_rpcs_loop(client_rx, client_tx, state, message_ids)
+        });
+    }
+
+    /// Run the election loop, sleeping randomly between checks if a new election term
+    /// should be launched.
+    ///
+    /// Random sleep breaks candidacy live-locks:
+    ///
+    /// > if many followers become candidates at the same time, votes could be split so
+    /// > that no candidate obtains a majority. When this happens, each candidate will
+    /// > time out and start a new election by incrementing its term and initiating
+    /// > another round
+    fn election_loop(
+        raft_tx: PeerSender<rpc::RaftMessage<<S as StateMachine>::Command>>,
+        state: Arc<Mutex<State<S>>>,
+    ) -> ! {
+        loop {
+            state
+                .lock()
+                .expect("no poison")
+                .maybe_begin_election(raft_tx.clone());
+
+            // Poll as frequently as feasible. Note, the election deadline this monitors
+            // can be bumped forward *at any time*, so we cannot just sleep once and
+            // wake up. So while we don't have async niceties and to avoid callback
+            // hell, just poll. Jitter for good measure (break out of simultaneous
+            // startup more efficiently).
+            let d = Duration::from_millis(100);
+            let jitter = Duration::from_secs_f64(d.as_secs_f64() * 0.2 * rand::rand());
+            thread::sleep(d + jitter);
+        }
+    }
+
+    /// Run the log replication loop.
+    ///
+    /// While logs are replicating opportunistically whenever possible in response to
+    /// client requests, a background loop is still necessary for idle periods of no
+    /// clients request. In those, (empty) heartbeats need to be sent to Raft peers to
+    /// retain leadership.
+    ///
+    /// Raft also specifies we retry RPCs like AppendEntries; a background loop covers
+    /// this as well.
+    ///
+    /// > If followers crash or run slowly, or if network packets are lost, the leader
+    /// > retries AppendEntries RPCs indefinitely (even after it has responded to the
+    /// > client) until all followers eventually store all log entries.
+    fn log_replication_loop(
+        raft_tx: PeerSender<rpc::RaftMessage<<S as StateMachine>::Command>>,
+        state: Arc<Mutex<State<S>>>,
+    ) {
+        loop {
+            state
+                .lock()
+                .expect("no poison")
+                .replicate_log(raft_tx.clone());
+
+            thread::sleep(HEARTBEAT_INTERVAL);
+        }
+    }
+
+    /// Handles all Raft messages incoming on the receiver channel, forwarding them to
+    /// the core Raft engine, responding on the out channel.
+    ///
+    /// ## Panics
+    ///
+    /// - if any channel's other end closes
+    fn incoming_raft_rpcs_loop(
+        raft_rx: PeerReceiver<rpc::RaftMessage<S::Command>>,
+        raft_tx: PeerSender<rpc::RaftMessage<S::Command>>,
+        state: Arc<Mutex<State<S>>>,
+        machine: &mut S,
+    ) {
+        for (peer, msg) in raft_rx.iter() {
+            // Check if another node has a more advanced logical clock.
+            let remote_term = msg.term();
+            state
+                .lock()
+                .expect("no poison")
+                .maybe_step_down(remote_term);
+
+            // Even if we stepped down to follower, implying we were in the logical
+            // past, replying is still useful (e.g. to vote for an eligible candidate
+            // peer).
+
+            match msg {
+                rpc::RaftMessage::RequestVote {
+                    candidate_term,
+                    last_log_index,
+                    last_log_term,
+                } => {
+                    let resp = state.lock().expect("no poison").handle_vote_request(
+                        peer.clone(),
+                        candidate_term,
+                        last_log_index,
+                        last_log_term,
+                    );
+                    raft_tx
+                        .send((peer, resp))
+                        .expect("raft message receiver should never hang up");
+                }
+                rpc::RaftMessage::RequestVoteResponse { term, vote_granted } => state
+                    .lock()
+                    .expect("no poison")
+                    .handle_vote_response(peer, term, vote_granted, raft_tx.clone()),
+                rpc::RaftMessage::AppendEntries {
+                    term,
+                    commit_index,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                } => {
+                    let resp = state.lock().expect("no poison").handle_append_entries(
+                        peer.clone(),
+                        term,
+                        commit_index,
+                        prev_log_index,
+                        prev_log_term,
+                        entries,
+                        machine,
+                    );
+                    raft_tx
+                        .send((peer, resp))
+                        .expect("raft message receiver should never hang up");
+                }
+                rpc::RaftMessage::AppendEntriesResponse { index, success, .. } => {
+                    state
+                        .lock()
+                        .expect("no poison")
+                        .handle_append_entries_response(
+                            peer,
+                            success,
+                            index,
+                            raft_tx.clone(),
+                            machine,
+                        );
+                }
+            };
+        }
+
+        // If we get here we're non-functional due to programming error, blow up and
+        // start over.
+        panic!("raft request sender should never hang up");
+    }
+
+    /// Handles all client messages incoming on the receiver channel, forwarding them to
+    /// the core Raft engine, responding on the out channel **once replication
+    /// occurred**.
+    ///
+    /// ## Panics
+    ///
+    /// - if any channel's other end closes
+    fn incoming_client_rpcs_loop<K, V>(
+        client_rx: PeerReceiver<rpc::ClientMessage<K, V>>,
+        client_tx: PeerSender<rpc::ClientMessage<K, V>>,
+        state: Arc<Mutex<State<S>>>,
+        mut message_ids: impl Iterator<Item = NodeMessageID>,
+    ) where
+        S::Command: From<(
+            // for creating state machine commands from incoming messages + a callback
+            // channel for responses
+            NodeID,
+            NodeMessageID,
+            rpc::ClientMessage<K, V>,
+            PeerSender<ClientMessage<K, V>>,
         )>,
     {
-        // Periodic election launch
-        thread::Builder::new()
-            .name("raft-election-loop".into())
-            .spawn({
-                let state = Arc::clone(&self.state);
-                let raft_tx = raft_tx.clone();
+        for (client, msg) in client_rx.iter() {
+            let response_id = message_ids.next().expect("should never run out of IDs");
 
-                move || {
-                    // "if many followers become candidates at the same time, votes
-                    // could be split so that no candidate obtains a majority. When this
-                    // happens, each candidate will time out and start a new election by
-                    // incrementing its term and initiating another round"
-                    loop {
-                        state
-                            .lock()
-                            .expect("no poison")
-                            .maybe_begin_election(raft_tx.clone());
-
-                        // Poll as frequently as feasible. Note, the election deadline
-                        // this monitors can be bumped forward *at any time*, so we
-                        // cannot just sleep once and wake up. So while we don't have
-                        // async niceties and to avoid callback hell, just poll. Jitter
-                        // for good measure (break out of simultaneous startup more
-                        // efficiently).
-                        let d = Duration::from_millis(100);
-                        let jitter = Duration::from_secs_f64(d.as_secs_f64() * 0.2 * rand::rand());
-                        thread::sleep(d + jitter);
+            let is_leader = state.lock().expect("no poison").is_leader();
+            if !is_leader {
+                let resp = if let Some(leader) = state.lock().expect("no poison").current_leader() {
+                    // TODO: proxy to leader.
+                    rpc::ClientMessage::ErrorResponse {
+                        in_reply_to: msg.id(),
+                        id: response_id.get(),
+                        code: ReservedErrorCode::TemporarilyUnavailable.into(),
+                        text: format!("not a leader, current leader {leader}"),
                     }
-                }
-            })
-            .expect("thread creation should always succeed");
-
-        // Periodic log replication
-        thread::Builder::new()
-            .name("raft-log-replication-loop".into())
-            .spawn({
-                let state = Arc::clone(&self.state);
-                let raft_tx = raft_tx.clone();
-
-                move || {
-                    loop {
-                        // > If followers crash or run slowly, or if network packets are
-                        // > lost, the leader retries AppendEntries RPCs indefinitely
-                        // > (even after it has responded to the client) until all
-                        // > followers eventually store all log entries.
-                        state
-                            .lock()
-                            .expect("no poison")
-                            .replicate_log(raft_tx.clone());
-
-                        thread::sleep(HEARTBEAT_INTERVAL);
+                } else {
+                    rpc::ClientMessage::ErrorResponse {
+                        in_reply_to: msg.id(),
+                        id: response_id.get(),
+                        code: ReservedErrorCode::TemporarilyUnavailable.into(),
+                        text: "not a leader and current leader unknown".into(),
                     }
+                };
+
+                client_tx
+                    .send((client, resp))
+                    .expect("client message receiver should never hang up");
+
+                continue;
+            };
+
+            match msg {
+                rpc::ClientMessage::WriteRequest { .. }
+                | ClientMessage::ReadRequest { .. }
+                | ClientMessage::CASRequest { .. } => {
+                    // Client request goes into log (in a more efficient format than raw
+                    // RPC requests), carrying a callback channel on which the client
+                    // response is sent once the state machine applies the command,
+                    // implying replication is reached and responding is safe.
+                    let cmd: S::Command = (client, response_id, msg, client_tx.clone()).into();
+                    state.lock().expect("no poison").append(cmd);
                 }
-            })
-            .expect("thread creation should always succeed");
-
-        // Handle incoming Raft messages
-        thread::Builder::new()
-            .name("raft-handle-incoming-raft-msgs".into())
-            .spawn({
-                let state = Arc::clone(&self.state);
-                let raft_tx = raft_tx.clone();
-
-                // This thread is responsible for driving the state machine forward.
-                let mut machine = self.state_machine;
-
-                move || {
-                    for (peer, msg) in raft_rx.iter() {
-                        // Check if another node has a more advanced logical clock.
-                        let remote_term = msg.term();
-                        state
-                            .lock()
-                            .expect("no poison")
-                            .maybe_step_down(remote_term);
-
-                        // Even if we stepped down to follower, still reply as reply is
-                        // useful (e.g. to vote for an eligible peer).
-
-                        match msg {
-                            rpc::RaftMessage::RequestVote {
-                                candidate_term,
-                                last_log_index,
-                                last_log_term,
-                            } => {
-                                let resp = state.lock().expect("no poison").handle_vote_request(
-                                    peer.clone(),
-                                    candidate_term,
-                                    last_log_index,
-                                    last_log_term,
-                                );
-                                raft_tx
-                                    .send((peer, resp))
-                                    .expect("raft message receiver should never hang up");
-                            }
-                            rpc::RaftMessage::RequestVoteResponse { term, vote_granted } => state
-                                .lock()
-                                .expect("no poison")
-                                .handle_vote_response(peer, term, vote_granted, raft_tx.clone()),
-                            rpc::RaftMessage::AppendEntries {
-                                term,
-                                commit_index,
-                                prev_log_index,
-                                prev_log_term,
-                                entries,
-                            } => {
-                                eprintln!(
-                                    "handling append entries from {} on term {} for {} entries",
-                                    peer,
-                                    term,
-                                    entries.inner.len()
-                                );
-
-                                let resp = state.lock().expect("no poison").handle_append_entries(
-                                    peer.clone(),
-                                    term,
-                                    commit_index,
-                                    prev_log_index,
-                                    prev_log_term,
-                                    entries,
-                                    &mut machine,
-                                );
-                                raft_tx
-                                    .send((peer, resp))
-                                    .expect("raft message receiver should never hang up");
-                            }
-                            rpc::RaftMessage::AppendEntriesResponse { index, success, .. } => {
-                                state
-                                    .lock()
-                                    .expect("no poison")
-                                    .handle_append_entries_response(
-                                        peer,
-                                        success,
-                                        index,
-                                        raft_tx.clone(),
-                                        &mut machine,
-                                    );
-                            }
-                        };
-                    }
-
-                    panic!("requests sender should never hang up");
+                rpc::ClientMessage::ReadResponse { .. }
+                | rpc::ClientMessage::WriteResponse { .. }
+                | rpc::ClientMessage::CASResponse { .. }
+                | rpc::ClientMessage::ErrorResponse { .. } => {
+                    unimplemented!("client responses should never be routed to nodes, only clients")
                 }
-            })
-            .expect("creation should succeed");
+            };
+        }
 
-        // Handle incoming client messages
-        thread::Builder::new()
-            .name("raft-handle-incoming-client-msgs".into())
-            .spawn({
-                let state = Arc::clone(&self.state);
-                let client_tx = client_tx.clone();
-
-                move || {
-                    for (client, msg) in client_rx.iter() {
-                        // This check is pessimistic; it's safe to reject requests if
-                        // we're not the leader. It is NOT safe to reply if just this
-                        // check passes, without also confirming reads from quorum.
-                        let is_leader = state.lock().expect("no poison").is_leader();
-
-                        if !is_leader {
-                            let resp = if let Some(leader) =
-                                state.lock().expect("no poison").current_leader()
-                            {
-                                // TODO: proxy to leader.
-                                rpc::ClientMessage::ErrorResponse {
-                                    in_reply_to: msg.id(),
-                                    id: msg_id_gen
-                                        .next()
-                                        .expect("should never run out of IDs")
-                                        .get(),
-                                    code: ReservedErrorCode::TemporarilyUnavailable.into(),
-                                    text: format!("not a leader, current leader {leader}"),
-                                }
-                            } else {
-                                rpc::ClientMessage::ErrorResponse {
-                                    in_reply_to: msg.id(),
-                                    id: msg_id_gen
-                                        .next()
-                                        .expect("should never run out of IDs")
-                                        .get(),
-                                    code: ReservedErrorCode::TemporarilyUnavailable.into(),
-                                    text: "not a leader and current leader unknown".into(),
-                                }
-                            };
-
-                            client_tx
-                                .send((client, resp))
-                                .expect("client message receiver should never hang up");
-
-                            continue;
-                        };
-
-                        match msg {
-                            rpc::ClientMessage::WriteRequest { .. }
-                            | ClientMessage::ReadRequest { .. }
-                            | ClientMessage::CASRequest { .. } => {
-                                // Client request goes into log (in a more efficient
-                                // format than raw RPC requests), carrying a callback
-                                // channel on which the client response is sent once the
-                                // state machine applies the command, implying
-                                // replication is reached and responding is safe.
-                                let cmd: S::Command = (client, msg, client_tx.clone()).into();
-                                state.lock().expect("no poison").append(cmd);
-                            }
-                            rpc::ClientMessage::ReadResponse { .. }
-                            | rpc::ClientMessage::WriteResponse { .. }
-                            | rpc::ClientMessage::CASResponse { .. }
-                            | rpc::ClientMessage::ErrorResponse { .. } => unimplemented!(
-                                "client responses should never be routed to nodes, only clients"
-                            ),
-                        };
-                    }
-
-                    panic!("requests sender should never hang up");
-                }
-            })
-            .expect("creation should succeed");
+        // If we get here we're non-functional due to programming error, blow up and
+        // start over.
+        panic!("client requests sender should never hang up");
     }
+}
+
+fn launch_named_background_task<F>(name: &str, f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    thread::Builder::new()
+        .name(name.into())
+        .spawn(f)
+        .expect("(named) thread creation should always succeed");
 }
 
 impl<K, V> StateMachine for HashMap<K, V>
@@ -335,12 +395,8 @@ where
     fn apply(&mut self, cmd: Self::Command) {
         // If not set, use a bogus default: we will not end up sending this on the wire
         // anyway.
+        let id = cmd.response_id.unwrap_or_default();
         let in_reply_to = cmd.in_reply_to.unwrap_or_default();
-
-        let id = NodeMessageIdGenerator
-            .next()
-            .expect("should never run out of IDs")
-            .get();
 
         let resp = match cmd.inner {
             WireCommand::Read { key } => {
@@ -422,40 +478,46 @@ pub struct Command<K, V> {
     /// respond to clients anymore anyway. Clients need to retry.
     ///
     /// The below are pure in-memory concepts.
-    in_reply_to: Option<MessageId>,
+    response_id: Option<MessageID>,
+    in_reply_to: Option<MessageID>,
     client: Option<NodeID>,
-    respond: Option<Sender<(String, rpc::ClientMessage<K, V>)>>,
+    respond: Option<PeerSender<rpc::ClientMessage<K, V>>>,
 }
 
 impl<K, V>
     From<(
         NodeID,
+        NodeMessageID,
         rpc::ClientMessage<K, V>,
-        Sender<(String, rpc::ClientMessage<K, V>)>,
+        PeerSender<rpc::ClientMessage<K, V>>,
     )> for Command<K, V>
 {
     fn from(
-        (client, msg, chan): (
+        (client, response_id, msg, chan): (
             NodeID,
+            NodeMessageID,
             rpc::ClientMessage<K, V>,
-            Sender<(String, rpc::ClientMessage<K, V>)>,
+            PeerSender<rpc::ClientMessage<K, V>>,
         ),
     ) -> Self {
         match msg {
             ClientMessage::ReadRequest { key, id } => Self {
                 inner: WireCommand::Read { key },
+                response_id: Some(response_id.get()),
                 in_reply_to: Some(id),
                 client: Some(client),
                 respond: Some(chan),
             },
             ClientMessage::WriteRequest { key, value, id } => Self {
                 inner: WireCommand::Write { key, value },
+                response_id: Some(response_id.get()),
                 in_reply_to: Some(id),
                 client: Some(client),
                 respond: Some(chan),
             },
             ClientMessage::CASRequest { key, from, to, id } => Self {
                 inner: WireCommand::CAS { key, from, to },
+                response_id: Some(response_id.get()),
                 in_reply_to: Some(id),
                 client: Some(client),
                 respond: Some(chan),
@@ -481,6 +543,7 @@ impl<K: Deserialize, V: Deserialize> Deserialize for Command<K, V> {
         let op = Deserialize::deserialize(value)?;
         Ok(Self {
             inner: op,
+            response_id: None,
             in_reply_to: None,
             client: None,
             respond: None,

@@ -1,16 +1,18 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::rpc::MessageID;
+
 pub mod infra;
 pub mod rpc;
 
-/// Message IDs local to this node. Monotonically increasing. Reset on node reboot.
-/// Construct via [`NodeMessageIdGenerator`].
+/// Message IDs local to this node. **Unique**. Monotonically increasing. Reset on node
+/// reboot. Construct via [`NodeMessageIDGenerator`].
 #[derive(Debug)]
-pub struct NodeMessageId(u64);
+pub struct NodeMessageID(MessageID);
 
-impl NodeMessageId {
+impl NodeMessageID {
     /// Read-only.
-    pub fn get(&self) -> u64 {
+    pub fn get(&self) -> MessageID {
         self.0
     }
 }
@@ -19,14 +21,14 @@ impl NodeMessageId {
 static CURRENT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
-pub struct NodeMessageIdGenerator;
+pub struct NodeMessageIDGenerator;
 
-impl Iterator for NodeMessageIdGenerator {
-    type Item = NodeMessageId;
+impl Iterator for NodeMessageIDGenerator {
+    type Item = NodeMessageID;
 
     fn next(&mut self) -> Option<Self::Item> {
         // This is self-consistent so relaxed ordering suffices
-        Some(NodeMessageId(
+        Some(NodeMessageID(
             CURRENT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed),
         ))
     }

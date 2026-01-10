@@ -8,7 +8,7 @@ use json::serde::{Deserialize, Serialize};
 use crate::LogIndex;
 use crate::state::{Log, Term};
 
-pub(crate) type MessageId = u64;
+pub(crate) type MessageID = u64;
 
 #[derive(Debug, Clone)]
 pub enum Message<K, V, C> {
@@ -105,42 +105,42 @@ impl<C> RaftMessage<C> {
 pub enum ClientMessage<K, V> {
     ReadRequest {
         key: K,
-        id: MessageId,
+        id: MessageID,
     },
     WriteRequest {
         key: K,
         value: V,
-        id: MessageId,
+        id: MessageID,
     },
     CASRequest {
         key: K,
         from: V,
         to: V,
-        id: MessageId,
+        id: MessageID,
     },
     ReadResponse {
-        in_reply_to: MessageId,
+        in_reply_to: MessageID,
         value: V,
-        id: MessageId,
+        id: MessageID,
     },
     WriteResponse {
-        in_reply_to: MessageId,
-        id: MessageId,
+        in_reply_to: MessageID,
+        id: MessageID,
     },
     CASResponse {
-        in_reply_to: MessageId,
-        id: MessageId,
+        in_reply_to: MessageID,
+        id: MessageID,
     },
     ErrorResponse {
-        in_reply_to: MessageId,
-        id: MessageId,
+        in_reply_to: MessageID,
+        id: MessageID,
         code: u64,
         text: String,
     },
 }
 
 impl<K, V> ClientMessage<K, V> {
-    pub fn id(&self) -> MessageId {
+    pub fn id(&self) -> MessageID {
         match self {
             ClientMessage::ReadRequest { id, .. }
             | ClientMessage::WriteRequest { id, .. }

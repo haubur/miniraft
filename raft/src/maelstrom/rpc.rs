@@ -4,7 +4,7 @@ use json::Value as JSONValue;
 use json::serde::{Deserialize, Serialize};
 
 use crate::NodeID;
-use crate::rpc::MessageId;
+use crate::rpc::MessageID;
 
 /// <https://github.com/jepsen-io/maelstrom/blob/cb7f07239012d85d2c0595fd942ddb4613205905/doc/protocol.md#message-bodies>
 #[derive(Debug)]
@@ -54,14 +54,14 @@ where
 /// message](https://github.com/jepsen-io/maelstrom/blob/cb7f07239012d85d2c0595fd942ddb4613205905/doc/protocol.md#initialization).
 #[derive(Debug)]
 pub(crate) struct InitRequest {
-    pub(crate) message_id: MessageId,
+    pub(crate) message_id: MessageID,
     pub(crate) node_id: NodeID,
     pub(crate) node_ids: Vec<NodeID>,
 }
 
 #[derive(Debug)]
 pub(crate) struct InitResponse {
-    pub(crate) in_reply_to: MessageId,
+    pub(crate) in_reply_to: MessageID,
 }
 
 impl Deserialize for InitRequest {

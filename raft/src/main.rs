@@ -3,7 +3,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use raft::Engine;
-use raft::maelstrom::NodeMessageIdGenerator;
+use raft::maelstrom::NodeMessageIDGenerator;
 use raft::maelstrom::infra::{read, read_and_handle_init, route_incoming, send};
 use raft::maelstrom::rpc::MessageEnvelope;
 use raft::rpc::Message;
@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         raft_outgoing_tx,
         client_incoming_rx,
         client_outgoing_tx,
-        NodeMessageIdGenerator,
+        NodeMessageIDGenerator,
     );
 
     // Handle outgoing Raft messages
