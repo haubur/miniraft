@@ -245,7 +245,7 @@ impl<S: StateMachine> State<S> {
         if remote > self.c.current_term {
             eprintln!("stepping down: {} < remote {}", self.c.current_term, remote);
             self.c.current_term.set(remote);
-            self.become_follower();
+            self.become_follower(/* new term, so voted for... */ None);
         } else {
             eprintln!(
                 "not stepping down: {} >= remote {}",
@@ -306,13 +306,13 @@ impl<S: StateMachine> State<S> {
         self.request_votes(outgoing);
     }
 
-    pub(super) fn become_follower(&mut self) {
+    pub(super) fn become_follower(&mut self, voted_for: Option<NodeID>) {
         match self.r {
             Role::Candidate { .. } | Role::Leader { .. } => {
                 eprintln!("becoming follower for term {}", self.c.current_term);
                 self.r = Role::Follower {
                     leader: None,
-                    voted_for: None,
+                    voted_for,
                 }
             }
             Role::Follower { .. } => {
@@ -574,7 +574,10 @@ impl<S: StateMachine> State<S> {
             // Receiving AppendEntries _in a term we are currently candidating for_ must
             // mean another peer established themselves as leader. Cancel our candidacy
             // and get in line.
-            self.become_follower();
+            //
+            // Retains "voted for" as _in this term_, as a candidate, we _did_ vote for
+            // ourselves.
+            self.become_follower(Some(self.c.id.clone()));
         }
 
         assert_eq!(
