@@ -6,14 +6,14 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Debug, Display};
 use std::io::{self, Read, Write};
-use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use json::error::Error as JSONError;
 use json::serde::{Deserialize, DeserializeError, Serialize, SerializeError};
 
 use crate::{
-    ELECTION_TIMEOUT, HEARTBEAT_INTERVAL, LogIndex, MIN_REPLICATION_INTERVAL, NodeID, rpc,
+    ELECTION_TIMEOUT, HEARTBEAT_INTERVAL, LogIndex, MIN_REPLICATION_INTERVAL, NodeID, PeerSender,
+    rpc,
 };
 
 /// Abstraction for a state machine, to which Raft applies commands from its log
@@ -333,7 +333,7 @@ impl<S: StateMachine> State<S> {
     /// > election to choose a new leader.
     pub(super) fn maybe_begin_election(
         &mut self,
-        outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>,
+        outgoing: PeerSender<rpc::RaftMessage<S::Command>>,
     ) {
         eprintln!("maybe beginning election");
 
@@ -354,7 +354,7 @@ impl<S: StateMachine> State<S> {
     }
 
     /// Become a candidate and start an election.
-    fn become_candidate(&mut self, outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>) {
+    fn become_candidate(&mut self, outgoing: PeerSender<rpc::RaftMessage<S::Command>>) {
         assert!(self.election_timeout_passed());
         eprintln!("becoming candidate and beginning election");
 
@@ -401,7 +401,7 @@ impl<S: StateMachine> State<S> {
     ///
     /// > When a leader first comes to power, it initializes all nextIndex values to the
     /// > index just after the last one in its log
-    fn become_leader(&mut self, outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>) {
+    fn become_leader(&mut self, outgoing: PeerSender<rpc::RaftMessage<S::Command>>) {
         self.r = if let Role::Candidate { .. } = self.r {
             Role::Leader {
                 next_indexes: self
@@ -439,7 +439,7 @@ impl<S: StateMachine> State<S> {
     }
 
     /// Request votes from *all* other nodes.
-    fn request_votes(&self, outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>) {
+    fn request_votes(&self, outgoing: PeerSender<rpc::RaftMessage<S::Command>>) {
         eprintln!("requesting votes for term {}", self.p.current_term);
 
         for node in &self.v.node_ids {
@@ -554,7 +554,7 @@ impl<S: StateMachine> State<S> {
         peer: NodeID,
         remote_term: Term,
         vote_granted: bool,
-        outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>,
+        outgoing: PeerSender<rpc::RaftMessage<S::Command>>,
     ) {
         eprintln!(
             "handling vote response from {} on term {}, vote granted: {}",
@@ -720,7 +720,7 @@ impl<S: StateMachine> State<S> {
         peer: NodeID,
         success: bool,
         index: LogIndex,
-        outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>,
+        outgoing: PeerSender<rpc::RaftMessage<S::Command>>,
         machine: &mut S,
     ) {
         let Role::Leader {
@@ -774,10 +774,7 @@ impl<S: StateMachine> State<S> {
 impl<S: StateMachine> State<S> {
     /// During leadership, replicate local log to all relevant peers, potentially
     /// sending an empty replication request for heartbeat.
-    pub(super) fn replicate_log(
-        &mut self,
-        outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>,
-    ) {
+    pub(super) fn replicate_log(&mut self, outgoing: PeerSender<rpc::RaftMessage<S::Command>>) {
         let Role::Leader {
             next_indexes,
             last_replication,
