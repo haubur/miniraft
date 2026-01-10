@@ -499,10 +499,7 @@ impl<S: StateMachine> State<S> {
 
             match self.c.current_term.cmp(&remote_term) {
                 Ordering::Less => {
-                    eprintln!(
-                        "ignoring vote: term {} < {}",
-                        remote_term, self.c.current_term
-                    );
+                    unreachable!("should have stepped down from candidacy beforehand")
                 }
                 Ordering::Equal => {
                     eprintln!("accepting favorable vote from {}", peer);
@@ -515,7 +512,10 @@ impl<S: StateMachine> State<S> {
                     }
                 }
                 Ordering::Greater => {
-                    unreachable!("should have stepped down from candidacy beforehand")
+                    eprintln!(
+                        "ignoring stale vote: local term {} > remote {}",
+                        self.c.current_term, remote_term,
+                    );
                 }
             }
         } else {
