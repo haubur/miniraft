@@ -40,25 +40,20 @@ impl Term {
 
 impl Display for Term {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        Display::fmt(&self.0, f)
     }
 }
 
+/// An entry in the Raft log.
 #[derive(Debug, Default, PartialEq, Clone)]
 pub(crate) struct LogEntry<Cmd> {
-    /// Command to apply to state machine.
+    /// Command to apply to state machine once this log entry is considered committed.
     pub(crate) cmd: Cmd,
     /// Term in which this entry was received by leader.
     pub(crate) term: Term,
 }
 
-impl<Cmd: Display> Display for LogEntry<Cmd> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{}", self.cmd.to_string().escape_default())?;
-        write!(f, "{}", self.term)
-    }
-}
-
+/// The Raft log. 1-indexed.
 #[derive(Debug, PartialEq, Clone)]
 pub struct Log<Cmd> {
     pub(crate) inner: Vec<LogEntry<Cmd>>,
@@ -76,6 +71,7 @@ impl<Cmd: Default> Default for Log<Cmd> {
 }
 
 impl<Cmd> Log<Cmd> {
+    /// Get entry at given index, if any.
     fn get(&self, index: LogIndex) -> Option<&LogEntry<Cmd>> {
         let index: usize = (index.get() - 1)
             .try_into()
@@ -83,6 +79,7 @@ impl<Cmd> Log<Cmd> {
         self.inner.get(index)
     }
 
+    /// Get all entries starting from the given entry, if any.
     fn get_from(&self, index: LogIndex) -> Option<&[LogEntry<Cmd>]> {
         let index: usize = (index.get() - 1)
             .try_into()
@@ -90,6 +87,7 @@ impl<Cmd> Log<Cmd> {
         self.inner.get(index..)
     }
 
+    /// Replace all entries starting at given index with new ones.
     fn replace_from(&mut self, index: LogIndex, with: Box<[LogEntry<Cmd>]>) {
         let index: usize = (index.get() - 1)
             .try_into()
@@ -115,6 +113,10 @@ impl<Cmd> Log<Cmd> {
     }
 }
 
+/// Persistent node state.
+///
+/// Needs to be persisted to stable storage before responding to requests, and restored
+/// from it on node boot.
 #[derive(Debug, PartialEq)]
 pub struct Persistent<Cmd> {
     pub(crate) current_term: Term,
@@ -122,18 +124,7 @@ pub struct Persistent<Cmd> {
     pub(crate) log: Log<Cmd>,
 }
 
-impl<Cmd: Display> Display for Persistent<Cmd> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{}/", self.current_term)?;
-        if let Some(ref voted_for) = self.voted_for {
-            write!(f, "{voted_for}/")?;
-        }
-        writeln!(f)?;
-
-        Ok(())
-    }
-}
-
+/// Error raised when persisting or restoring from stable storage.
 #[derive(Debug)]
 pub enum PersistenceError {
     Serialize(SerializeError),
@@ -198,7 +189,7 @@ impl<Cmd: Serialize> Persistent<Cmd> {
 impl<Cmd: Deserialize> Persistent<Cmd> {
     /// Restores from a reader. The reader is read until EOF.
     pub fn restore(src: &mut impl Read) -> Result<Self, PersistenceError> {
-        let mut buf = Vec::with_capacity(32);
+        let mut buf = Vec::with_capacity(1_024);
         src.read_to_end(&mut buf)?;
         let jval = json::parse(&buf)?;
 
@@ -239,6 +230,7 @@ impl Volatile {
 }
 
 impl Volatile {
+    /// Extends election deadline, with randomness to break candidacy live-locks.
     fn extend_election_deadline(&mut self) {
         let add = Duration::from_secs_f64(ELECTION_TIMEOUT.as_secs_f64() * (rand::rand() + 1.0));
         self.election_deadline = Instant::now() + add;
@@ -296,13 +288,64 @@ pub(crate) enum State<S: StateMachine> {
     Transitioning,
 }
 
-/// For transitions, see Figure 4 of <https://raft.github.io/raft.pdf>.
+/// Basic implementations.
 impl<S: StateMachine> State<S> {
     pub(super) fn new(id: NodeID, node_ids: Vec<NodeID>, p: Persistent<S::Command>) -> Self {
         Self::Follower {
             p,
             v: Volatile::new(id, node_ids),
             leader: None,
+        }
+    }
+
+    fn v(&self) -> &Volatile {
+        match self {
+            State::Follower { v, .. } | State::Candidate { v, .. } | State::Leader { v, .. } => v,
+            State::Transitioning => unreachable!("in transition"),
+        }
+    }
+
+    fn v_mut(&mut self) -> &mut Volatile {
+        match self {
+            State::Follower { v, .. } | State::Candidate { v, .. } | State::Leader { v, .. } => v,
+            State::Transitioning => unreachable!("in transition"),
+        }
+    }
+
+    fn p(&self) -> &Persistent<S::Command> {
+        match self {
+            State::Follower { p, .. } | State::Candidate { p, .. } | State::Leader { p, .. } => p,
+            State::Transitioning => unreachable!("in transition"),
+        }
+    }
+
+    fn p_mut(&mut self) -> &mut Persistent<S::Command> {
+        match self {
+            State::Follower { p, .. } | State::Candidate { p, .. } | State::Leader { p, .. } => p,
+            State::Transitioning => unreachable!("in transition"),
+        }
+    }
+}
+
+/// Implementations for transitions, see Figure 4 of <https://raft.github.io/raft.pdf>.
+impl<S: StateMachine> State<S> {
+    /// If the remote term is ahead, step down as we're behind.
+    ///
+    /// Use to fulfill:
+    ///
+    /// > If RPC request or response contains term T > currentTerm: set currentTerm = T,
+    /// > convert to follower (§5.1)
+    ///
+    /// Note this applies to _any_ RPC request.
+    pub(super) fn maybe_step_down(&mut self, remote: Term) {
+        let p = self.p_mut();
+        if remote > p.current_term {
+            eprintln!("stepping down: {} < remote {}", p.current_term, remote);
+            p.current_term.set(remote);
+            p.voted_for = None; // In this new term, not voted for anyone yet
+            self.become_follower();
+        } else {
+            eprintln!("not stepping down: {} >= remote {}", p.current_term, remote);
         }
     }
 
@@ -362,7 +405,7 @@ impl<S: StateMachine> State<S> {
         self.request_votes(outgoing);
     }
 
-    pub(crate) fn become_follower(&mut self) {
+    pub(super) fn become_follower(&mut self) {
         // Allow a new candidate or leader to emerge before trying again for candidacy
         // ourselves right away.
         self.v_mut().extend_election_deadline();
@@ -380,10 +423,7 @@ impl<S: StateMachine> State<S> {
         };
     }
 
-    pub(crate) fn become_leader(
-        &mut self,
-        outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>,
-    ) {
+    fn become_leader(&mut self, outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>) {
         *self = if let Self::Candidate { p, v, .. } = mem::replace(self, Self::Transitioning) {
             Self::Leader {
                 l: Leader {
@@ -422,7 +462,7 @@ impl<S: StateMachine> State<S> {
     }
 
     /// Request votes from *all* other nodes.
-    pub(crate) fn request_votes(&self, outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>) {
+    fn request_votes(&self, outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>) {
         eprintln!("requesting votes for term {}", self.p().current_term);
 
         for node in &self.v().node_ids {
@@ -439,10 +479,15 @@ impl<S: StateMachine> State<S> {
                 .expect("receiver should never hang up");
         }
     }
+}
 
+/// Implementations for handling requests. Note how client requests were turned into
+/// plain log commands in a higher application layer, so at this stage all we see is
+/// pure log commands.
+impl<S: StateMachine> State<S> {
     /// Handle a request for a leadership vote from some remote candidate.
     #[must_use]
-    pub(crate) fn handle_vote_request(
+    pub(super) fn handle_vote_request(
         &mut self,
         candidate_id: NodeID,
         candidate_term: Term,
@@ -528,7 +573,7 @@ impl<S: StateMachine> State<S> {
     /// Handle a response to a previous vote request we sent.
     ///
     /// Note these responses can be arbitrarily delayed and correspondingly malformed.
-    pub(crate) fn handle_vote_response(
+    pub(super) fn handle_vote_response(
         &mut self,
         peer: NodeID,
         remote_term: Term,
@@ -587,7 +632,7 @@ impl<S: StateMachine> State<S> {
     /// progressed to the next indicated commit index.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn handle_append_entries(
+    pub(super) fn handle_append_entries(
         &mut self,
         peer: NodeID,
         leader_term: Term,
@@ -686,7 +731,7 @@ impl<S: StateMachine> State<S> {
     ///
     /// If not successful, log replication is immediately retried via the outgoing
     /// channel. If successful, we advance the state machine.
-    pub(crate) fn handle_append_entries_response(
+    pub(super) fn handle_append_entries_response(
         &mut self,
         peer: NodeID,
         success: bool,
@@ -742,28 +787,14 @@ impl<S: StateMachine> State<S> {
         *match_index = Some(index);
         self.advance_commit_index(machine);
     }
+}
 
-    /// If the remote term is ahead, step down as we're behind.
-    ///
-    /// Use to fulfill:
-    ///
-    /// > If RPC request or response contains term T > currentTerm: set currentTerm = T,
-    /// > convert to follower (§5.1)
-    ///
-    /// Note this applies to _any_ RPC request.
-    pub(crate) fn maybe_step_down(&mut self, remote: Term) {
-        let p = self.p_mut();
-        if remote > p.current_term {
-            eprintln!("stepping down: {} < remote {}", p.current_term, remote);
-            p.current_term.set(remote);
-            p.voted_for = None; // In this new term, not voted for anyone yet
-            self.become_follower();
-        } else {
-            eprintln!("not stepping down: {} >= remote {}", p.current_term, remote);
-        }
-    }
-
-    pub(crate) fn replicate_log(
+/// Implementations relevant to log handling (e.g. replication), mostly relevant while
+/// holding leadership.
+impl<S: StateMachine> State<S> {
+    /// During leadership, replicate local log to all relevant peers, potentially
+    /// sending an empty replication request for heartbeat.
+    pub(super) fn replicate_log(
         &mut self,
         outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>,
     ) {
@@ -852,7 +883,7 @@ impl<S: StateMachine> State<S> {
         }
     }
 
-    pub(crate) fn append(&mut self, cmd: S::Command) {
+    pub(super) fn append(&mut self, cmd: S::Command) {
         let term = self.p().current_term;
         self.p_mut()
             .log
@@ -861,7 +892,10 @@ impl<S: StateMachine> State<S> {
 
     /// During leadership, advance the commit index if to the highest possible watermark
     /// among all peers.
-    pub fn advance_commit_index(&mut self, machine: &mut S) {
+    ///
+    /// > If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥
+    /// > N, and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4)
+    fn advance_commit_index(&mut self, machine: &mut S) {
         let Self::Leader { v, p, l } = self else {
             unreachable!("need to be leader to advance commit index");
         };
@@ -934,44 +968,16 @@ impl<S: StateMachine> State<S> {
     }
 
     #[must_use]
-    pub(crate) fn is_leader(&self) -> bool {
+    pub(super) fn is_leader(&self) -> bool {
         matches!(self, Self::Leader { .. })
     }
 
     #[must_use]
-    pub(crate) fn current_leader(&self) -> Option<&NodeID> {
+    pub(super) fn current_leader(&self) -> Option<&NodeID> {
         if let Self::Follower { leader, .. } = self {
             leader.as_ref()
         } else {
             None
-        }
-    }
-
-    pub(crate) fn v(&self) -> &Volatile {
-        match self {
-            State::Follower { v, .. } | State::Candidate { v, .. } | State::Leader { v, .. } => v,
-            State::Transitioning => unreachable!("in transition"),
-        }
-    }
-
-    pub(crate) fn v_mut(&mut self) -> &mut Volatile {
-        match self {
-            State::Follower { v, .. } | State::Candidate { v, .. } | State::Leader { v, .. } => v,
-            State::Transitioning => unreachable!("in transition"),
-        }
-    }
-
-    pub(crate) fn p(&self) -> &Persistent<S::Command> {
-        match self {
-            State::Follower { p, .. } | State::Candidate { p, .. } | State::Leader { p, .. } => p,
-            State::Transitioning => unreachable!("in transition"),
-        }
-    }
-
-    pub(crate) fn p_mut(&mut self) -> &mut Persistent<S::Command> {
-        match self {
-            State::Follower { p, .. } | State::Candidate { p, .. } | State::Leader { p, .. } => p,
-            State::Transitioning => unreachable!("in transition"),
         }
     }
 }
