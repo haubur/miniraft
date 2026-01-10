@@ -49,12 +49,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Other Raft peers contacting this node (at any time)
     let (raft_incoming_tx, raft_incoming_rx) = mpsc::channel();
+
+    // This node contacting other Raft peers (at any time)
     let (raft_outgoing_tx, raft_outgoing_rx) = mpsc::channel();
 
+    // Cluster clients contacting this node (at any time)
     let (client_incoming_tx, client_incoming_rx) = mpsc::channel();
+
+    // This node contacting cluster clients (at any time)
     let (client_outgoing_tx, client_outgoing_rx) = mpsc::channel();
 
+    // Note, the concrete key-value types are set below, **a single time** for the
+    // entire application. They cascade down to everything through generics + type
+    // inference, and are thus easily pluggable (might need to provide ser/de
+    // implementations!) at no performance cost (everything is generic, not `dyn`).
     let raft: Engine<HashMap<u64, i64>> =
         Engine::new(this_node.clone(), remote_nodes.clone(), persistent_state);
     raft.start(
