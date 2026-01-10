@@ -1,9 +1,11 @@
+//! Note this module has no concept of client requests and state machine implementation
+//! details, such as key-value store requests.
+
 use std::cmp::{self, Ordering};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{self, Debug, Display};
 use std::io::{self, Read, Write};
-use std::mem;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -239,90 +241,63 @@ impl Volatile {
     }
 }
 
-/// State specific to and only usable from a leadership position.
-#[derive(Debug, Default)]
-pub(crate) struct Leader {
-    /// Node IDs mapped to the next log index to replicate to them.
+/// The entire state of this Raft node.
+///
+/// Its responsibilities are state transitions and log handling in response to Raft
+/// messages.
+///
+/// It is only aware of some generic state machine, whose commands it applies, without
+/// knowing which those are specifically. Commands are handed back out to the injected
+/// state machine, which is responsible for actual application. This allows this core
+/// Raft state to focus on pure Raft domain logic.
+#[derive(Debug)]
+pub(crate) struct State<S: StateMachine> {
+    /// Persistent state, survives reboots.
     ///
-    /// Does not include the leader node itself (we do not send logs to ourselves).
-    next_indexes: HashMap<NodeID, LogIndex>,
-    /// Node IDs mapped to the highest log entry known to be replicated to that node.
+    /// Common to all roles.
+    p: Persistent<S::Command>,
+    /// Volatile state, recreated on reboot.
     ///
-    /// Does not include the leader node itself.
-    match_indexes: HashMap<NodeID, Option<LogIndex>>,
-    /// Timestamp of last replication to *any* peer.
-    last_replication: Option<Instant>,
+    /// Common to all roles.
+    v: Volatile,
+    /// Current role, containing all role-specific state.
+    r: Role,
 }
 
 #[derive(Debug)]
-pub(crate) enum State<S: StateMachine> {
+pub(crate) enum Role {
     Follower {
-        p: Persistent<S::Command>,
-        v: Volatile,
         /// Who we _believe_ the current leader is -- this can never be conclusive and
-        /// can only ever be used for e.g. performance improvements (i.e. nothing
-        /// related to correctness).
+        /// can only ever be used in e.g. performance improvements (i.e. nothing
+        /// critical to correctness).
         leader: Option<NodeID>,
     },
     Candidate {
-        p: Persistent<S::Command>,
-        v: Volatile,
         /// The votes for us, for this term's candidacy.
         votes: HashSet<NodeID>,
     },
     Leader {
-        p: Persistent<S::Command>,
-        v: Volatile,
-        l: Leader,
+        /// Node IDs mapped to the next log index to replicate to them.
+        ///
+        /// Does not include the leader node itself (we do not send logs to ourselves).
+        next_indexes: HashMap<NodeID, LogIndex>,
+        /// Node IDs mapped to the highest log entry known to be replicated to that
+        /// node.
+        ///
+        /// Does not include the leader node itself.
+        match_indexes: HashMap<NodeID, Option<LogIndex>>,
+        /// Timestamp of last replication to *any* peer.
+        last_replication: Option<Instant>,
     },
-
-    /// For internal ownership handling.
-    ///
-    /// We need ownership of e.g. leader state to potentially drop. Else we'd leak, if
-    /// we transitioned away. We can't take ownership as that would make for awkward
-    /// APIs; we generally do `&mut self`. As such, this variant enables a pattern like
-    /// [`Option::take`].
-    ///
-    /// TODO: revisit if we can refactor enum into product type, such that `p` and `v`
-    /// are common to all variants (which they are, cf. [`State::p`] etc.)
-    Transitioning,
 }
 
 /// Basic implementations.
 impl<S: StateMachine> State<S> {
     pub(super) fn new(id: NodeID, node_ids: Vec<NodeID>, p: Persistent<S::Command>) -> Self {
-        Self::Follower {
+        Self {
             p,
             v: Volatile::new(id, node_ids),
-            leader: None,
-        }
-    }
-
-    fn v(&self) -> &Volatile {
-        match self {
-            State::Follower { v, .. } | State::Candidate { v, .. } | State::Leader { v, .. } => v,
-            State::Transitioning => unreachable!("in transition"),
-        }
-    }
-
-    fn v_mut(&mut self) -> &mut Volatile {
-        match self {
-            State::Follower { v, .. } | State::Candidate { v, .. } | State::Leader { v, .. } => v,
-            State::Transitioning => unreachable!("in transition"),
-        }
-    }
-
-    fn p(&self) -> &Persistent<S::Command> {
-        match self {
-            State::Follower { p, .. } | State::Candidate { p, .. } | State::Leader { p, .. } => p,
-            State::Transitioning => unreachable!("in transition"),
-        }
-    }
-
-    fn p_mut(&mut self) -> &mut Persistent<S::Command> {
-        match self {
-            State::Follower { p, .. } | State::Candidate { p, .. } | State::Leader { p, .. } => p,
-            State::Transitioning => unreachable!("in transition"),
+            r: Role::Follower { leader: None },
         }
     }
 }
@@ -338,14 +313,16 @@ impl<S: StateMachine> State<S> {
     ///
     /// Note this applies to _any_ RPC request.
     pub(super) fn maybe_step_down(&mut self, remote: Term) {
-        let p = self.p_mut();
-        if remote > p.current_term {
-            eprintln!("stepping down: {} < remote {}", p.current_term, remote);
-            p.current_term.set(remote);
-            p.voted_for = None; // In this new term, not voted for anyone yet
+        if remote > self.p.current_term {
+            eprintln!("stepping down: {} < remote {}", self.p.current_term, remote);
+            self.p.current_term.set(remote);
+            self.p.voted_for = None; // In this new term, not voted for anyone yet
             self.become_follower();
         } else {
-            eprintln!("not stepping down: {} >= remote {}", p.current_term, remote);
+            eprintln!(
+                "not stepping down: {} >= remote {}",
+                self.p.current_term, remote
+            );
         }
     }
 
@@ -365,15 +342,15 @@ impl<S: StateMachine> State<S> {
             return;
         }
 
-        if let State::Leader { v, .. } = self {
-            v.extend_election_deadline()
+        if let Role::Leader { .. } = self.r {
+            self.v.extend_election_deadline()
         } else {
             self.become_candidate(outgoing)
         }
     }
 
     fn election_timeout_passed(&self) -> bool {
-        Instant::now() > self.v().election_deadline
+        Instant::now() > self.v.election_deadline
     }
 
     /// Become a candidate and start an election.
@@ -381,78 +358,78 @@ impl<S: StateMachine> State<S> {
         assert!(self.election_timeout_passed());
         eprintln!("becoming candidate and beginning election");
 
-        *self = if let Self::Follower { mut p, mut v, .. } | Self::Candidate { mut p, mut v, .. } =
-            mem::replace(self, Self::Transitioning)
-        {
+        self.r = if let Role::Follower { .. } | Role::Candidate { .. } = self.r {
             // Vote for ourselves. We're selfish like that.
-            let this = v.id.clone();
+            let this = self.v.id.clone();
             let votes = HashSet::from([this.clone()]);
-            p.voted_for = Some(this);
+            self.p.voted_for = Some(this);
 
             // Every new election is a new term.
-            p.current_term.step();
+            self.p.current_term.step();
 
             // Give time for election to proceed. Otherwise, will become candidate again
             // right away (ending this term prematurely).
-            v.extend_election_deadline();
+            self.v.extend_election_deadline();
 
-            Self::Candidate { p, v, votes }
+            Role::Candidate { votes }
         } else {
-            unreachable!("invalid transition from {:?}", self)
+            unreachable!("invalid transition from {:?}", self.r)
         };
 
-        eprintln!("became candidate for term {}", self.p().current_term);
+        eprintln!("became candidate for term {}", self.p.current_term);
         self.request_votes(outgoing);
     }
 
     pub(super) fn become_follower(&mut self) {
         // Allow a new candidate or leader to emerge before trying again for candidacy
         // ourselves right away.
-        self.v_mut().extend_election_deadline();
+        self.v.extend_election_deadline();
 
-        *self = match mem::replace(self, Self::Transitioning) {
-            Self::Candidate { p, v, .. } | Self::Leader { p, v, l: _ } => {
-                eprintln!("becoming follower for term {}", p.current_term);
-                Self::Follower { p, v, leader: None }
+        match self.r {
+            Role::Candidate { .. } | Role::Leader { .. } => {
+                eprintln!("becoming follower for term {}", self.p.current_term);
             }
-            Self::Follower { p, v, .. } => {
-                eprintln!("remaining follower for term {}", p.current_term);
-                Self::Follower { p, v, leader: None }
+            Role::Follower { .. } => {
+                eprintln!("remaining follower for term {}", self.p.current_term);
             }
-            Self::Transitioning => unreachable!("in transition"),
         };
+
+        self.r = Role::Follower { leader: None }
     }
 
+    /// Become a leader, initiating necessary state.
+    ///
+    /// > When a leader first comes to power, it initializes all nextIndex values to the
+    /// > index just after the last one in its log
     fn become_leader(&mut self, outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>) {
-        *self = if let Self::Candidate { p, v, .. } = mem::replace(self, Self::Transitioning) {
-            Self::Leader {
-                l: Leader {
-                    // > When a leader first comes to power, it initializes all
-                    // > nextIndex values to the index just after the last one in its
-                    // > log
-                    next_indexes: v
-                        .node_ids
-                        .iter()
-                        .map(|id| {
-                            assert_ne!(id, &v.id);
-                            (
-                                id.clone(),
-                                LogIndex::try_from(p.log.highest_index().get() + 1)
-                                    .expect("always at least 1"),
-                            )
-                        })
-                        .collect(),
-                    match_indexes: v.node_ids.iter().map(|id| (id.clone(), None)).collect(),
-                    last_replication: None,
-                },
-                p,
-                v,
+        self.r = if let Role::Candidate { .. } = self.r {
+            Role::Leader {
+                next_indexes: self
+                    .v
+                    .node_ids
+                    .iter()
+                    .map(|id| {
+                        assert_ne!(id, &self.v.id);
+                        (
+                            id.clone(),
+                            LogIndex::try_from(self.p.log.highest_index().get() + 1)
+                                .expect("always at least 1"),
+                        )
+                    })
+                    .collect(),
+                match_indexes: self
+                    .v
+                    .node_ids
+                    .iter()
+                    .map(|id| (id.clone(), None))
+                    .collect(),
+                last_replication: None,
             }
         } else {
-            unreachable!("need to be candidate to become leader: {:?}", self)
+            unreachable!("need to be candidate to become leader, was: {:?}", self.r)
         };
 
-        eprintln!("became leader for term {}", self.p().current_term);
+        eprintln!("became leader for term {}", self.p.current_term);
 
         // > Upon election: send initial empty AppendEntries RPCs (heartbeat) to each
         // > server; repeat during idle periods to prevent election timeouts (§5.2)
@@ -463,17 +440,17 @@ impl<S: StateMachine> State<S> {
 
     /// Request votes from *all* other nodes.
     fn request_votes(&self, outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>) {
-        eprintln!("requesting votes for term {}", self.p().current_term);
+        eprintln!("requesting votes for term {}", self.p.current_term);
 
-        for node in &self.v().node_ids {
+        for node in &self.v.node_ids {
             outgoing
                 .send((
                     node.clone(),
                     rpc::RaftMessage::RequestVote {
-                        candidate_term: self.p().current_term,
-                        last_log_index: LogIndex::try_from(self.p().log.highest_index())
+                        candidate_term: self.p.current_term,
+                        last_log_index: LogIndex::try_from(self.p.log.highest_index())
                             .expect("should always have at least 1 log entry"),
-                        last_log_term: self.p().log.last().term,
+                        last_log_term: self.p.log.last().term,
                     },
                 ))
                 .expect("receiver should never hang up");
@@ -499,25 +476,24 @@ impl<S: StateMachine> State<S> {
             candidate_id, candidate_term
         );
         assert_ne!(
-            self.v().id,
-            candidate_id,
+            self.v.id, candidate_id,
             "should never be requested to vote for self"
         );
 
-        let Self::Follower { p, v, .. } = self else {
+        let Role::Follower { .. } = self.r else {
             eprintln!("rejecting vote: am candidate or leader already");
             return rpc::RaftMessage::RequestVoteResponse {
-                term: self.p().current_term,
+                term: self.p.current_term,
                 vote_granted: false,
             };
         };
 
         let vote_granted = {
-            if candidate_term < p.current_term {
+            if candidate_term < self.p.current_term {
                 // Candidate is in the logical past.
                 false
             } else {
-                match &p.voted_for {
+                match &self.p.voted_for {
                     Some(voted_for) if candidate_id != *voted_for => {
                         // We already voted for a different candidate in this
                         // term.
@@ -529,7 +505,7 @@ impl<S: StateMachine> State<S> {
                         // (to support that candidate retrying), under certain
                         // conditions.
 
-                        let t = p.log.last().term;
+                        let t = self.p.log.last().term;
                         match candidate_last_log_term.cmp(&t) {
                             Ordering::Less => {
                                 eprintln!(
@@ -539,7 +515,7 @@ impl<S: StateMachine> State<S> {
                                 false
                             }
                             Ordering::Equal => {
-                                let longer = candidate_last_log_index >= p.log.highest_index();
+                                let longer = candidate_last_log_index >= self.p.log.highest_index();
                                 eprintln!(
                                     "got candidate logs from same term {}, candidate log is >=? {}",
                                     t, longer
@@ -556,16 +532,16 @@ impl<S: StateMachine> State<S> {
 
         if vote_granted {
             // Register new state *before* replying
-            p.voted_for = Some(candidate_id.clone());
+            self.p.voted_for = Some(candidate_id.clone());
             // Allow time for voting session to conclude; without us running for
             // candidacy prematurely (starting a new term, invalidating our own
             // vote in this term).
-            v.extend_election_deadline();
+            self.v.extend_election_deadline();
         }
 
         eprintln!("granting vote to {}: {}", candidate_id, vote_granted);
         rpc::RaftMessage::RequestVoteResponse {
-            term: p.current_term,
+            term: self.p.current_term,
             vote_granted,
         }
     }
@@ -589,13 +565,19 @@ impl<S: StateMachine> State<S> {
             return; // Too bad
         }
 
-        if let Self::Candidate { p, v, votes } = self {
+        if let Role::Candidate { votes } = &mut self.r {
             assert!(vote_granted);
-            assert!(votes.contains(&v.id), "should always vote for ourselves");
+            assert!(
+                votes.contains(&self.v.id),
+                "should always vote for ourselves"
+            );
 
-            match p.current_term.cmp(&remote_term) {
+            match self.p.current_term.cmp(&remote_term) {
                 Ordering::Less => {
-                    eprintln!("ignoring vote: term {} < {}", remote_term, p.current_term);
+                    eprintln!(
+                        "ignoring vote: term {} < {}",
+                        remote_term, self.p.current_term
+                    );
                 }
                 Ordering::Equal => {
                     eprintln!("accepting favorable vote from {}", peer);
@@ -612,7 +594,6 @@ impl<S: StateMachine> State<S> {
                 }
             }
         } else {
-            assert!(!matches!(self, Self::Transitioning));
             // For example, because we _just became_ a leader by majority vote, and
             // further peers' favorable votes arrived after we already stepped up.
             eprintln!("ignoring vote: not currently a candidate (anymore)");
@@ -621,7 +602,7 @@ impl<S: StateMachine> State<S> {
 
     #[must_use]
     fn won_election(&self, votes_received: usize) -> bool {
-        let cluster_size = self.v().node_ids.len() + 1; // Cluster + ourselves
+        let cluster_size = self.v.node_ids.len() + 1; // Cluster + ourselves
         let n_majority = cluster_size / 2 + 1;
         votes_received >= n_majority
     }
@@ -647,11 +628,11 @@ impl<S: StateMachine> State<S> {
             leader_term, leader_commit_index, leader_prev_log_index, leader_prev_log_term
         );
 
-        let current_term = self.p().current_term;
+        let current_term = self.p.current_term;
 
         let failure_msg = rpc::RaftMessage::AppendEntriesResponse {
             current_term,
-            index: self.p().log.highest_index(),
+            index: self.p.log.highest_index(),
             success: false,
         };
 
@@ -661,9 +642,9 @@ impl<S: StateMachine> State<S> {
         }
 
         // This is a valid leader. Don't compete with it.
-        self.v_mut().extend_election_deadline();
+        self.v.extend_election_deadline();
 
-        if let Self::Candidate { .. } = self {
+        if let Role::Candidate { .. } = self.r {
             // Receiving AppendEntries _in a term we are currently candidating for_ must
             // mean another peer established themselves as leader. Cancel our candidacy
             // and get in line.
@@ -674,10 +655,10 @@ impl<S: StateMachine> State<S> {
             leader_term, current_term,
             "should have stepped down already if remote were greater"
         );
-        if let Self::Follower { v, leader, .. } = self {
+        if let Role::Follower { leader } = &mut self.r {
             // Invariant, as we might use this to proxy client requests to the leader;
             // if it's ourselves that's an infinite loop.
-            assert_ne!(v.id, peer, "current leader can never be self");
+            assert_ne!(self.v.id, peer, "current leader can never be self");
 
             *leader = Some(peer); // Recognize this leader
         } else {
@@ -689,7 +670,7 @@ impl<S: StateMachine> State<S> {
             unreachable!("in same term, if no longer candidate, can only be follower");
         };
 
-        match self.p().log.get(leader_prev_log_index) {
+        match self.p.log.get(leader_prev_log_index) {
             Some(entry) if entry.term != leader_prev_log_term => {
                 // We have an entry at the _index_ but its _term_ does not match.
                 return failure_msg;
@@ -703,20 +684,23 @@ impl<S: StateMachine> State<S> {
 
         // Consistency check with induction step OK.
 
-        self.p_mut().log.replace_from(
+        self.p.log.replace_from(
             leader_prev_log_index
                 .checked_add(1)
                 .expect("log length should never exceed range"),
             entries.inner.into_boxed_slice(),
         );
 
-        let new_index = self.p().log.highest_index();
-        let v = self.v_mut();
+        let new_index = self.p.log.highest_index();
         if let Some(leader_commit_index) = leader_commit_index
-            && leader_commit_index > v.commit_index.unwrap_or(LogIndex::new(1).expect("1 > 0"))
+            && leader_commit_index
+                > self
+                    .v
+                    .commit_index
+                    .unwrap_or(LogIndex::new(1).expect("1 > 0"))
         {
             // Leader sent a commit index and ours is lower: advance.
-            v.commit_index = Some(cmp::min(leader_commit_index, new_index));
+            self.v.commit_index = Some(cmp::min(leader_commit_index, new_index));
             self.advance_state_machine(machine);
         }
 
@@ -739,15 +723,11 @@ impl<S: StateMachine> State<S> {
         outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>,
         machine: &mut S,
     ) {
-        let Self::Leader {
-            l:
-                Leader {
-                    next_indexes,
-                    match_indexes,
-                    ..
-                },
+        let Role::Leader {
+            next_indexes,
+            match_indexes,
             ..
-        } = self
+        } = &mut self.r
         else {
             eprintln!("ignoring append entries response from {peer}: no longer a leader");
             return;
@@ -798,16 +778,11 @@ impl<S: StateMachine> State<S> {
         &mut self,
         outgoing: Sender<(NodeID, rpc::RaftMessage<S::Command>)>,
     ) {
-        let State::Leader {
-            p,
-            v,
-            l:
-                Leader {
-                    next_indexes: next_index,
-                    last_replication,
-                    ..
-                },
-        } = self
+        let Role::Leader {
+            next_indexes,
+            last_replication,
+            ..
+        } = &mut self.r
         else {
             eprintln!("replicate log: not a leader");
             return;
@@ -828,8 +803,8 @@ impl<S: StateMachine> State<S> {
             true
         };
 
-        for node_id in &v.node_ids {
-            let next_index_for_node = next_index
+        for node_id in &self.v.node_ids {
+            let next_index_for_node = next_indexes
                 .get(node_id)
                 .expect("should have entry for all known cluster nodes");
             assert!(
@@ -839,13 +814,14 @@ impl<S: StateMachine> State<S> {
 
             let prev_log_index =
                 LogIndex::try_from(next_index_for_node.get() - 1).expect("checked above");
-            let prev_log_term = p
+            let prev_log_term = self
+                .p
                 .log
                 .get(prev_log_index)
                 .expect("should always have a preceding entry")
                 .term;
 
-            let entries = if let Some(entries) = p.log.get_from(*next_index_for_node) {
+            let entries = if let Some(entries) = self.p.log.get_from(*next_index_for_node) {
                 entries.to_vec() // Note, might be empty
             } else {
                 vec![]
@@ -853,13 +829,13 @@ impl<S: StateMachine> State<S> {
             let n_entries = entries.len();
 
             let msg = rpc::RaftMessage::AppendEntries {
-                term: p.current_term,
+                term: self.p.current_term,
                 prev_log_index,
                 prev_log_term,
                 entries: Log {
                     inner: { entries.clone() },
                 },
-                commit_index: v.commit_index,
+                commit_index: self.v.commit_index,
             };
 
             if n_entries == 0 && !heartbeat_needed {
@@ -869,7 +845,7 @@ impl<S: StateMachine> State<S> {
 
             eprintln!(
                 "replicate log: local size {}, sending {} entries to {}: {:?}",
-                p.log.highest_index(),
+                self.p.log.highest_index(),
                 n_entries,
                 node_id,
                 entries
@@ -884,8 +860,8 @@ impl<S: StateMachine> State<S> {
     }
 
     pub(super) fn append(&mut self, cmd: S::Command) {
-        let term = self.p().current_term;
-        self.p_mut()
+        let term = self.p.current_term;
+        self.p
             .log
             .append(vec![LogEntry { cmd, term }].into_boxed_slice());
     }
@@ -896,13 +872,13 @@ impl<S: StateMachine> State<S> {
     /// > If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥
     /// > N, and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4)
     fn advance_commit_index(&mut self, machine: &mut S) {
-        let Self::Leader { v, p, l } = self else {
+        let Role::Leader { match_indexes, .. } = &self.r else {
             unreachable!("need to be leader to advance commit index");
         };
 
         // We might not have match indexes for _all_ peers yet. If at least one is
         // missing, abort.
-        let match_index: Option<Vec<_>> = l.match_indexes.values().cloned().collect();
+        let match_index: Option<Vec<_>> = match_indexes.values().cloned().collect();
         let Some(mut match_index) = match_index else {
             eprintln!("advance commit index: skipping: some peers without match index");
             return;
@@ -911,53 +887,50 @@ impl<S: StateMachine> State<S> {
         let n = *lower_median(&mut match_index)
             .expect("all peers have match index recorded, and there is at least one peer");
 
-        let Some(entry) = p.log.get(n) else {
+        let Some(entry) = self.p.log.get(n) else {
             eprintln!("advance commit index: skipping: no log entry at {n}");
             return;
         };
 
         // TODO: remove hack with 0-term
-        if entry.term != p.current_term && p.current_term > Term(0) {
+        if entry.term != self.p.current_term && self.p.current_term > Term(0) {
             // TODO: explain why
             eprintln!("advance commit index: log entry {n} not in current term");
             return;
         }
 
-        let commit_index = v.commit_index;
-        v.commit_index = cmp::max(commit_index, Some(n));
-        eprintln!("advance commit index: now {:?}", v.commit_index);
+        self.v.commit_index = cmp::max(self.v.commit_index, Some(n));
+        eprintln!("advance commit index: now {:?}", self.v.commit_index);
 
         self.advance_state_machine(machine);
     }
 
     /// Applies all outstanding log entries below the commit index to the state machine.
     fn advance_state_machine(&mut self, machine: &mut S) {
-        let (Self::Candidate { p, v, .. }
-        | Self::Follower { p, v, .. }
-        | Self::Leader { p, v, .. }) = self
-        else {
-            unreachable!("invalid: in transition");
-        };
-
         // Also excludes Some(last_applied) while commit index is None, which would be
         // an invariant violation. See also
         // https://doc.rust-lang.org/std/option/enum.Option.html#impl-Ord-for-Option%3CT%3E.
-        assert!(v.last_applied <= v.commit_index, "can never overtake");
+        assert!(
+            self.v.last_applied <= self.v.commit_index,
+            "can never overtake"
+        );
 
         let mut n = 1;
-        while v.last_applied < v.commit_index {
+        while self.v.last_applied < self.v.commit_index {
             // Increment
-            v.last_applied = Some(
-                v.last_applied
+            self.v.last_applied = Some(
+                self.v
+                    .last_applied
                     // On first application
                     .unwrap_or(LogIndex::new(1).expect("1 > 0"))
                     .checked_add(1)
                     .expect("commit index is valid and greater, this must be valid"),
             );
 
-            let log_entry = p
+            let log_entry = self
+                .p
                 .log
-                .get(v.last_applied.expect("always Some at this point"))
+                .get(self.v.last_applied.expect("always Some at this point"))
                 .expect("entries below commit index must exist (replicated)");
 
             machine.apply(log_entry.cmd.clone());
@@ -969,12 +942,12 @@ impl<S: StateMachine> State<S> {
 
     #[must_use]
     pub(super) fn is_leader(&self) -> bool {
-        matches!(self, Self::Leader { .. })
+        matches!(self.r, Role::Leader { .. })
     }
 
     #[must_use]
     pub(super) fn current_leader(&self) -> Option<&NodeID> {
-        if let Self::Follower { leader, .. } = self {
+        if let Role::Follower { leader } = &self.r {
             leader.as_ref()
         } else {
             None
