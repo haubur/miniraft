@@ -307,10 +307,6 @@ impl<S: StateMachine> State<S> {
     }
 
     pub(super) fn become_follower(&mut self) {
-        // Allow a new candidate or leader to emerge before trying again for candidacy
-        // ourselves right away.
-        self.c.extend_election_deadline();
-
         match self.r {
             Role::Candidate { .. } | Role::Leader { .. } => {
                 eprintln!("becoming follower for term {}", self.c.current_term);
