@@ -50,8 +50,10 @@ impl<S: StateMachine> From<&State<S>> for Persistent<S::Command> {
                     );
                     Some(state.c.id.clone())
                 }
-                // Leaders do not vote at all
-                Role::Leader { .. } => None,
+                Role::Leader { .. } => {
+                    // By implication, must have voted for self to become leader.
+                    Some(state.c.id.clone())
+                }
             },
             log: state.c.log.clone(), // Full clone!
         }
