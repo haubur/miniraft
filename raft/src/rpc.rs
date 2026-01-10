@@ -43,15 +43,17 @@ impl<K: Deserialize, V: Deserialize, C: Deserialize> Deserialize for Message<K, 
 #[derive(Debug, Clone)]
 pub enum RaftMessage<Cmd> {
     AppendEntries {
-        /// Leader's term
+        /// Leader's term.
         term: Term,
         /// Leader's commit index. No commits might have occurred yet.
         commit_index: Option<LogIndex>,
 
         /// Leader's index of log entry immediately preceding new ones.
-        prev_log_index: LogIndex,
+        ///
+        /// Unset if this is the very first request, sending _initial_ entries.
+        prev_log_index: Option<LogIndex>,
         /// Leader's term of log entry immediately preceding new ones.
-        prev_log_term: Term,
+        prev_log_term: Option<Term>,
 
         /// Log entries to store (empty for heartbeat). May send more than one for
         /// efficiency.
@@ -60,8 +62,11 @@ pub enum RaftMessage<Cmd> {
     AppendEntriesResponse {
         /// Current term, for leader to update itself.
         current_term: Term,
-        /// New index of updated follower log.
-        index: LogIndex,
+        /// New index of potentially updated follower log.
+        ///
+        /// Note if appending entries fails, no log update might happen, leaving empty
+        /// logs empty, thus having an index is optional.
+        index: Option<LogIndex>,
         /// True if follower contained entry matching previous log index and previous
         /// log term.
         success: bool,
@@ -69,10 +74,10 @@ pub enum RaftMessage<Cmd> {
     RequestVote {
         /// The requesting candidate's term.
         candidate_term: Term,
-        /// Index of candidate's last log entry.
-        last_log_index: LogIndex,
-        /// Term of candidate's last log entry.
-        last_log_term: Term,
+        /// Index of candidate's last log entry, if any.
+        last_log_index: Option<LogIndex>,
+        /// Term of candidate's last log entry, if any.
+        last_log_term: Option<Term>,
     },
     RequestVoteResponse {
         /// Node's term, for candidate to update itself.

@@ -26,6 +26,13 @@ type NodeID = String;
 /// Index of log entries. Raft is 1-indexed.
 pub(crate) type LogIndex = NonZero<u64>;
 
+/// Get the smallest permissible log index allowed in the 1-indexed Raft model.
+///
+/// (Helper function as we cannot `impl` on a foreign type.)
+pub(crate) fn min_log_index() -> LogIndex {
+    LogIndex::try_from(1).expect("1 > 0")
+}
+
 /// A pairing of node ID (client or Raft peer) and some message.
 type PeerMessage<M> = (NodeID, M);
 type PeerReceiver<M> = Receiver<PeerMessage<M>>;

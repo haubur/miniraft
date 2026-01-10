@@ -13,7 +13,7 @@ use json::serde::{Deserialize, DeserializeError, Serialize, SerializeError};
 
 use crate::{
     ELECTION_TIMEOUT, HEARTBEAT_INTERVAL, LogIndex, MIN_REPLICATION_INTERVAL, NodeID, PeerSender,
-    rpc,
+    min_log_index, rpc,
 };
 
 /// Abstraction for a state machine, to which Raft applies commands from its log
@@ -29,12 +29,14 @@ pub trait StateMachine: Default + Send + std::fmt::Debug {
 pub struct Term(pub(super) u64);
 
 impl Term {
+    /// Set term to a specific target.
     fn set(&mut self, to: Term) {
         assert!(to > *self, "need to advance forward");
 
         *self = to;
     }
 
+    /// Increment term by 1.
     fn step(&mut self) {
         self.set(Self(self.0 + 1));
     }
@@ -56,20 +58,9 @@ pub(crate) struct LogEntry<Cmd> {
 }
 
 /// The Raft log. 1-indexed.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Default)]
 pub struct Log<Cmd> {
     pub(crate) inner: Vec<LogEntry<Cmd>>,
-}
-
-impl<Cmd: Default> Default for Log<Cmd> {
-    fn default() -> Self {
-        Self {
-            inner: vec![LogEntry {
-                cmd: Cmd::default(),
-                term: Term::default(),
-            }],
-        }
-    }
 }
 
 impl<Cmd> Log<Cmd> {
@@ -98,15 +89,24 @@ impl<Cmd> Log<Cmd> {
         self.inner.extend(with);
     }
 
-    fn last(&self) -> &LogEntry<Cmd> {
-        self.inner
-            .last()
-            .expect("should always have at least one entry")
+    /// Gets the last log entry, if any.
+    fn last(&self) -> Option<&LogEntry<Cmd>> {
+        self.inner.last()
     }
 
-    fn highest_index(&self) -> LogIndex {
-        LogIndex::try_from(self.inner.len() as u64)
-            .expect("should always have at least 1 log entry")
+    /// Gets the index of the last log entry, if any.
+    fn highest_index(&self) -> Option<LogIndex> {
+        if self.inner.is_empty() {
+            None
+        } else {
+            let len: u64 = self
+                .inner
+                .len()
+                .try_into()
+                .expect("arch should be compatible");
+
+            Some(LogIndex::try_from(len).expect("not empty so len >= 1"))
+        }
     }
 
     // take ownership but make it read-only
@@ -412,8 +412,10 @@ impl<S: StateMachine> State<S> {
                         assert_ne!(id, &self.v.id);
                         (
                             id.clone(),
-                            LogIndex::try_from(self.p.log.highest_index().get() + 1)
-                                .expect("always at least 1"),
+                            self.p.log.highest_index().map_or(
+                                min_log_index(), // If log empty
+                                |hi| hi.checked_add(1).expect("should never exceed limit"),
+                            ),
                         )
                     })
                     .collect(),
@@ -448,9 +450,8 @@ impl<S: StateMachine> State<S> {
                     node.clone(),
                     rpc::RaftMessage::RequestVote {
                         candidate_term: self.p.current_term,
-                        last_log_index: LogIndex::try_from(self.p.log.highest_index())
-                            .expect("should always have at least 1 log entry"),
-                        last_log_term: self.p.log.last().term,
+                        last_log_index: self.p.log.highest_index(),
+                        last_log_term: self.p.log.last().map(|entry| entry.term),
                     },
                 ))
                 .expect("receiver should never hang up");
@@ -468,8 +469,8 @@ impl<S: StateMachine> State<S> {
         &mut self,
         candidate_id: NodeID,
         candidate_term: Term,
-        candidate_last_log_index: LogIndex,
-        candidate_last_log_term: Term,
+        candidate_last_log_index: Option<LogIndex>,
+        candidate_last_log_term: Option<Term>,
     ) -> rpc::RaftMessage<S::Command> {
         eprintln!(
             "handling vote request for {} on term {}",
@@ -505,11 +506,13 @@ impl<S: StateMachine> State<S> {
                         // (to support that candidate retrying), under certain
                         // conditions.
 
-                        let t = self.p.log.last().term;
+                        // Note, last terms might be none if the node has no log entries
+                        // at all.
+                        let t = self.p.log.last().map(|e| e.term);
                         match candidate_last_log_term.cmp(&t) {
                             Ordering::Less => {
                                 eprintln!(
-                                    "got candidate logs from past term {} < {}",
+                                    "got candidate logs from past or no term {:?} < {:?}",
                                     candidate_last_log_term, t
                                 );
                                 false
@@ -517,7 +520,7 @@ impl<S: StateMachine> State<S> {
                             Ordering::Equal => {
                                 let longer = candidate_last_log_index >= self.p.log.highest_index();
                                 eprintln!(
-                                    "got candidate logs from same term {}, candidate log is >=? {}",
+                                    "got candidate logs from same term {:?}, candidate log is >=? {}",
                                     t, longer
                                 );
 
@@ -618,13 +621,13 @@ impl<S: StateMachine> State<S> {
         peer: NodeID,
         leader_term: Term,
         leader_commit_index: Option<LogIndex>,
-        leader_prev_log_index: LogIndex,
-        leader_prev_log_term: Term,
+        leader_prev_log_index: Option<LogIndex>,
+        leader_prev_log_term: Option<Term>,
         entries: Log<S::Command>,
         machine: &mut S,
     ) -> rpc::RaftMessage<S::Command> {
         eprintln!(
-            "handling append entries for leader term {}, commit {:?}, p. log idx {}, p. log term {}",
+            "handling append entries for leader term {}, commit {:?}, p. log idx {:?}, p. log term {:?}",
             leader_term, leader_commit_index, leader_prev_log_index, leader_prev_log_term
         );
 
@@ -638,6 +641,7 @@ impl<S: StateMachine> State<S> {
 
         if leader_term < current_term {
             // Leader is in the logical past, let it know.
+            eprintln!("append entries: leader is in logical past");
             return failure_msg;
         }
 
@@ -670,43 +674,45 @@ impl<S: StateMachine> State<S> {
             unreachable!("in same term, if no longer candidate, can only be follower");
         };
 
-        match self.p.log.get(leader_prev_log_index) {
-            Some(entry) if entry.term != leader_prev_log_term => {
-                // We have an entry at the _index_ but its _term_ does not match.
-                return failure_msg;
-            }
-            None => {
-                // We have no entry at all at that index; terms can never match.
-                return failure_msg;
-            }
-            Some(entry) => assert_eq!(entry.term, leader_prev_log_term),
-        };
+        // See if we have, at the index requested by the leader, an entry at all. If we
+        // do, see if its term is identical to leader's.
+        //
+        // The leader might send no index at all, to indicate their log is empty.
+        if leader_prev_log_index.and_then(|idx| self.p.log.get(idx).map(|entry| entry.term))
+            != leader_prev_log_term
+        {
+            eprintln!("append entries: prev. local term is not {leader_prev_log_term:?}");
+            return failure_msg;
+        }
 
         // Consistency check with induction step OK.
 
         self.p.log.replace_from(
-            leader_prev_log_index
-                .checked_add(1)
-                .expect("log length should never exceed range"),
+            leader_prev_log_index.map_or(/* wipe it all */ min_log_index(), |idx| {
+                idx.checked_add(1)
+                    .expect("log length should never exceed range")
+            }),
             entries.inner.into_boxed_slice(),
         );
 
-        let new_index = self.p.log.highest_index();
-        if let Some(leader_commit_index) = leader_commit_index
-            && leader_commit_index
-                > self
-                    .v
-                    .commit_index
-                    .unwrap_or(LogIndex::new(1).expect("1 > 0"))
-        {
-            // Leader sent a commit index and ours is lower: advance.
-            self.v.commit_index = Some(cmp::min(leader_commit_index, new_index));
+        // Note, either of these can be none if a node has no commits yet.
+        if leader_commit_index > self.v.commit_index {
+            assert!(leader_commit_index.is_some(), "only greater if Some(_)");
+
+            // Advance, but clamp as leader might send a commit index _beyond_ the
+            // additional log entries it sent.
+            //
+            // Consider: high commit index sent, but our local log is empty and no
+            // leader log entries were sent either, leaving log log empty still. In this
+            // case our local commit index should remain empty as well. `Option` handles
+            // this all natively.
+            self.v.commit_index = cmp::min(leader_commit_index, self.p.log.highest_index());
             self.advance_state_machine(machine);
         }
 
         rpc::RaftMessage::AppendEntriesResponse {
             current_term,
-            index: new_index,
+            index: self.p.log.highest_index(),
             success: true,
         }
     }
@@ -719,7 +725,7 @@ impl<S: StateMachine> State<S> {
         &mut self,
         peer: NodeID,
         success: bool,
-        index: LogIndex,
+        index: Option<LogIndex>,
         outgoing: PeerSender<rpc::RaftMessage<S::Command>>,
         machine: &mut S,
     ) {
@@ -741,9 +747,9 @@ impl<S: StateMachine> State<S> {
         if !success {
             eprintln!("append entries: unsuccessful, decrementing {next_index} of {peer}");
 
-            // Decrement, floor it to minimum permissible index.
-            *next_index = LogIndex::try_from(next_index.get() - 1)
-                .unwrap_or(LogIndex::new(1).expect("1 > 0"));
+            // Decrement, floor it to minimum permissible index (sending "next index"
+            // below that makes no sense).
+            *next_index = LogIndex::try_from(next_index.get() - 1).unwrap_or(min_log_index());
 
             // Retry right away with new decremented value. This can be called anytime,
             // it internally ensures we don't replicate too often.
@@ -759,13 +765,18 @@ impl<S: StateMachine> State<S> {
             return;
         };
 
-        eprintln!("append entries: successful, indexes to {index} for {peer}");
-        // Peers send their new _current_ index. Note, this means indexes can go
-        // _backwards_ if an outdated response arrives late. That is safe, we will
-        // re-replicate from an earlier state.
-        *next_index = index.checked_add(1).expect("should never exceed log size");
-        *match_index = Some(index);
-        self.advance_commit_index(machine);
+        eprintln!("append entries: successful, indexes to {index:?} for {peer}");
+        if let Some(index) = index {
+            // Peers send their new _current_ index. Note, this means indexes can go
+            // _backwards_ if an outdated response arrives late. We will re-replicate
+            // from an earlier state for that node (wasteful but safe).
+            *next_index = index.checked_add(1).expect("should never exceed log size");
+            *match_index = Some(index);
+            self.advance_commit_index(machine);
+        }
+        // Note we ignore peers sending None for their new index, which is valid when
+        // bootstrapping from empty and sending an empty heartbeat. Peers will respond
+        // with success but there's no logs still.
     }
 }
 
@@ -804,33 +815,28 @@ impl<S: StateMachine> State<S> {
             let next_index_for_node = next_indexes
                 .get(node_id)
                 .expect("should have entry for all known cluster nodes");
-            assert!(
-                next_index_for_node.get() > 1,
-                "nodes all have the same entry for index 1 already"
-            );
 
-            let prev_log_index =
-                LogIndex::try_from(next_index_for_node.get() - 1).expect("checked above");
-            let prev_log_term = self
+            let entries = self
                 .p
                 .log
-                .get(prev_log_index)
-                .expect("should always have a preceding entry")
-                .term;
-
-            let entries = if let Some(entries) = self.p.log.get_from(*next_index_for_node) {
-                entries.to_vec() // Note, might be empty
-            } else {
-                vec![]
-            };
+                .get_from(*next_index_for_node)
+                .unwrap_or_default();
+            // Might still be empty! In which case there is nothing to replicate to this
+            // node, but a heartbeat might be necessary.
             let n_entries = entries.len();
+
+            // See if we can produce a previous log entry, from _before_ the entries
+            // slice.
+            let prev_log_index = LogIndex::try_from(next_index_for_node.get() - 1).ok();
+            let prev_log_term =
+                prev_log_index.and_then(|idx| self.p.log.get(idx).map(|entry| entry.term));
 
             let msg = rpc::RaftMessage::AppendEntries {
                 term: self.p.current_term,
                 prev_log_index,
                 prev_log_term,
                 entries: Log {
-                    inner: { entries.clone() },
+                    inner: { entries.to_vec() },
                 },
                 commit_index: self.v.commit_index,
             };
@@ -841,7 +847,7 @@ impl<S: StateMachine> State<S> {
             }
 
             eprintln!(
-                "replicate log: local size {}, sending {} entries to {}: {:?}",
+                "replicate log: local size {:?}, sending {} entries to {}: {:?}",
                 self.p.log.highest_index(),
                 n_entries,
                 node_id,
@@ -889,8 +895,7 @@ impl<S: StateMachine> State<S> {
             return;
         };
 
-        // TODO: remove hack with 0-term
-        if entry.term != self.p.current_term && self.p.current_term > Term(0) {
+        if entry.term != self.p.current_term {
             // TODO: explain why
             eprintln!("advance commit index: log entry {n} not in current term");
             return;
@@ -914,21 +919,22 @@ impl<S: StateMachine> State<S> {
 
         let mut n = 1;
         while self.v.last_applied < self.v.commit_index {
+            assert!(self.v.commit_index.is_some(), "can only be greater if Some");
+
             // Increment
             self.v.last_applied = Some(
                 self.v
                     .last_applied
-                    // On first application
-                    .unwrap_or(LogIndex::new(1).expect("1 > 0"))
-                    .checked_add(1)
-                    .expect("commit index is valid and greater, this must be valid"),
+                    .map_or(/* first application: */ min_log_index(), |idx| {
+                        idx.checked_add(1).expect("should never exceed limit")
+                    }),
             );
 
             let log_entry = self
                 .p
                 .log
                 .get(self.v.last_applied.expect("always Some at this point"))
-                .expect("entries below commit index must exist (replicated)");
+                .expect("Raft invariant: entries below commit index must exist (replicated)");
 
             machine.apply(log_entry.cmd.clone());
             n += 1;
