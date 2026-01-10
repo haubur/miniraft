@@ -4,7 +4,7 @@ An implementation of the [Raft distributed consensus
 protocol](https://raft.github.io/raft.pdf) for powering a key-value workload (read,
 write, CAS).
 
-- **dependency-free**, stdlib-only Rust
+- **dependency-free**, stdlib-only Rust (cold, release compile in ~1s)
   - [**custom JSON parser**](json/src/lib.rs) and ser/de framework, with OK performance
     (ballpark of ~220 MB/s throughput on Apple M3 on [complex
     input](json/benches/bench.rs) (UTF-16 surrogate etc.)) and **full spec compliance**,
