@@ -474,6 +474,7 @@ where
     }
 }
 
+/// A command for the Raft log, specific to the key-value store use case.
 #[derive(Debug, Clone)]
 pub struct Command<K, V> {
     inner: WireCommand<K, V>,
@@ -558,11 +559,28 @@ impl<K: Deserialize, V: Deserialize> Deserialize for Command<K, V> {
     }
 }
 
+/// An efficient, minimal representation of Raft commands for wire communication and
+/// disk I/O.
 #[derive(Debug, Clone)]
 pub enum WireCommand<K, V> {
-    Read { key: K },
-    Write { key: K, value: V },
-    CAS { key: K, from: V, to: V },
+    /// Note, reading does not alter state, so adding it to the log is not strictly
+    /// necessary and wastes space (state machine does not need Reads to reach full
+    /// valid state).
+    ///
+    /// However, reads also require consensus, which we get natively without any special
+    /// code paths and complexity by including it here.
+    Read {
+        key: K,
+    },
+    Write {
+        key: K,
+        value: V,
+    },
+    CAS {
+        key: K,
+        from: V,
+        to: V,
+    },
 }
 
 impl<K: Serialize, V: Serialize> Serialize for WireCommand<K, V> {
