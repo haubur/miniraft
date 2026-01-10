@@ -7,7 +7,7 @@ pub mod rpc;
 
 /// Message IDs local to this node. **Unique**. Monotonically increasing. Reset on node
 /// reboot. Construct via [`NodeMessageIDGenerator`].
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct NodeMessageID(MessageID);
 
 impl NodeMessageID {

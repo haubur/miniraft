@@ -54,7 +54,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// Client requests and leadership promotion can trigger opportunistic, immediate
 /// replication events; this interval rate limits those events, allowing batching for
 /// better network utilization (1 RPC with N messages over N RPCs with 1 message each).
-const MIN_REPLICATION_INTERVAL: Duration = Duration::from_millis(10);
+const MIN_REPLICATION_INTERVAL: Duration = Duration::from_millis(5);
 
 /// The engine driving core Raft state, and holding application state in the Raft state
 /// machine.
@@ -152,7 +152,10 @@ where
         launch_named_background_task("raft-handle-incoming-client-messages", {
             let state = Arc::clone(&self.state);
             let client_tx = client_tx.clone();
-            move || Self::incoming_client_rpcs_loop(client_rx, client_tx, state, message_ids)
+            let raft_tx = raft_tx.clone();
+            move || {
+                Self::incoming_client_rpcs_loop(client_rx, client_tx, raft_tx, state, message_ids)
+            }
         });
     }
 
@@ -316,12 +319,16 @@ where
     /// the core Raft engine, responding on the out channel **once replication
     /// occurred**.
     ///
+    /// Client requests arriving while this node is not a leader are **proxied** to the
+    /// leader, if possible. The leader response is then sent back to the client.
+    ///
     /// ## Panics
     ///
     /// - if any channel's other end closes
     fn incoming_client_rpcs_loop<K, V>(
         client_rx: PeerReceiver<rpc::ClientMessage<K, V>>,
         client_tx: PeerSender<rpc::ClientMessage<K, V>>,
+        raft_tx: PeerSender<rpc::RaftMessage<S::Command>>,
         state: Arc<Mutex<State<S>>>,
         mut message_ids: impl Iterator<Item = NodeMessageID>,
     ) where
@@ -334,51 +341,129 @@ where
             PeerSender<ClientMessage<K, V>>,
         )>,
     {
+        let max_proxies = 128;
+        let mut proxies = HashMap::with_capacity(max_proxies);
+        // Protect this node against unbounded (memory) growth. This _might_ drop
+        // inflight responses as a tradeoff.
+        assert!(proxies.len() <= max_proxies);
+
         for (client, msg) in client_rx.iter() {
             let response_id = message_ids.next().expect("should never run out of IDs");
 
+            // Copy bool out of lock, drop lock again ASAP.
             let is_leader = state.lock().expect("no poison").is_leader();
-            if !is_leader {
-                let resp = if let Some(leader) = state.lock().expect("no poison").current_leader() {
-                    // TODO: proxy to leader.
-                    rpc::ClientMessage::ErrorResponse {
-                        in_reply_to: msg.id(),
-                        id: response_id.get(),
-                        code: ReservedErrorCode::TemporarilyUnavailable.into(),
-                        text: format!("not a leader, current leader {leader}"),
-                    }
-                } else {
-                    rpc::ClientMessage::ErrorResponse {
-                        in_reply_to: msg.id(),
-                        id: response_id.get(),
-                        code: ReservedErrorCode::TemporarilyUnavailable.into(),
-                        text: "not a leader and current leader unknown".into(),
-                    }
-                };
 
-                client_tx
-                    .send((client, resp))
-                    .expect("client message receiver should never hang up");
-
-                continue;
-            };
-
-            match msg {
-                rpc::ClientMessage::WriteRequest { .. }
-                | ClientMessage::ReadRequest { .. }
-                | ClientMessage::CASRequest { .. } => {
-                    // Client request goes into log (in a more efficient format than raw
-                    // RPC requests), carrying a callback channel on which the client
-                    // response is sent once the state machine applies the command,
-                    // implying replication is reached and responding is safe.
-                    let cmd: S::Command = (client, response_id, msg, client_tx.clone()).into();
+            match (is_leader, msg) {
+                (
+                    true, // only leaders (should) add client requests to their log
+                    req @ (rpc::ClientMessage::WriteRequest { .. }
+                    | ClientMessage::ReadRequest { .. }
+                    | ClientMessage::CASRequest { .. }),
+                ) => {
+                    // Client request goes into leader log (in a more efficient format
+                    // than raw RPC requests), carrying a callback channel on which the
+                    // client response is sent once the state machine applies the
+                    // command, implying replication is reached and responding is safe.
+                    //
+                    // After successfully checking for leadership above, we might have
+                    // lost it by now. That's safe: we will (eventually) fail to commit
+                    // this new entry, a new leader will wipe it off our log, and we
+                    // will never end up replying to this client.
+                    let cmd: S::Command = (client, response_id, req, client_tx.clone()).into();
                     state.lock().expect("no poison").append(cmd);
+
+                    // Opportunistically replicate right away for minimum latency. This
+                    // is internally rate-limited so safe to call frequently.
+                    state
+                        .lock()
+                        .expect("no poison")
+                        .replicate_log(raft_tx.clone());
                 }
-                rpc::ClientMessage::ReadResponse { .. }
-                | rpc::ClientMessage::WriteResponse { .. }
-                | rpc::ClientMessage::CASResponse { .. }
-                | rpc::ClientMessage::ErrorResponse { .. } => {
-                    unimplemented!("client responses should never be routed to nodes, only clients")
+                (
+                    false, // as non-leader, we might still perform helpful work
+                    mut req @ (rpc::ClientMessage::WriteRequest { .. }
+                    | ClientMessage::ReadRequest { .. }
+                    | ClientMessage::CASRequest { .. }),
+                ) => {
+                    let leader = state.lock().expect("no poison").current_leader().cloned();
+
+                    // Proxy to a leader if known.
+                    let (node, msg) = if let Some(leader) = leader {
+                        if proxies.len() > max_proxies {
+                            eprintln!("clearing proxies");
+                            proxies.clear(); // Make room for this most recent request
+                        }
+
+                        // We might have become a leader by now while working! That's
+                        // OK: our proxy will never receive a response and just time
+                        // out. To make it safe, ensure we're not routing to ourselves.
+                        assert!(
+                            leader != state.lock().expect("no poison").c.id,
+                            "leader should always be someone else"
+                        );
+
+                        // Swap out message ID. This node's generated message IDs are
+                        // unique, so we use it to tell async responses apart later.
+                        // Note, if we crash, restart, generate the same node ID again,
+                        // client retries, _then_ we receive a _late_ response on the
+                        // _first_ proxy request, we will use a new proxy map entry for
+                        // an old response; if clients do not reuse IDs that should be
+                        // fine (= same ID -> same operation). Our response might differ
+                        // but linearizability for the client is retained.
+                        let original_id = req.id();
+                        let forward_id = response_id; // reuse but rename
+                        eprintln!(
+                            "proxying to known leader {leader}: {} -> {}",
+                            original_id,
+                            forward_id.get()
+                        );
+
+                        req.set_id(forward_id.get());
+                        let res = proxies.insert(forward_id.get(), (client, original_id));
+                        assert!(res.is_none(), "node IDs are unique per process");
+                        (leader, /* proxy original unchanged */ req)
+                    } else {
+                        // No (known) leader to proxy to, short-circuit to client
+                        // directly.
+                        (
+                            client,
+                            rpc::ClientMessage::ErrorResponse {
+                                in_reply_to: req.id(),
+                                id: response_id.get(),
+                                code: ReservedErrorCode::TemporarilyUnavailable.into(),
+                                text: "not a leader and current leader unknown".into(),
+                            },
+                        )
+                    };
+
+                    client_tx
+                        .send((node, msg))
+                        .expect("client message receiver should never hang up");
+                }
+                (
+                    // Since proxying initially, we might have changed to any other role
+                    // before a response arrived. We can always reply to the client
+                    // still, as if the response made it to here, it came from a
+                    // legitimate then-leader, so is authoritative (= committed), even
+                    // if outdated.
+                    _,
+                    mut resp @ (rpc::ClientMessage::ReadResponse { in_reply_to, .. }
+                    | rpc::ClientMessage::WriteResponse { in_reply_to, .. }
+                    | rpc::ClientMessage::CASResponse { in_reply_to, .. }
+                    | rpc::ClientMessage::ErrorResponse { in_reply_to, .. }),
+                ) => {
+                    if let Some((original_client, original_id)) = proxies.remove(&in_reply_to) {
+                        // Swap back for our own "in reply to"
+                        resp.set_id(original_id);
+                        client_tx
+                            .send((original_client, resp))
+                            .expect("client message receiver should never hang up");
+                    } else {
+                        eprintln!(
+                            "received client response without registered interest in reply to {}: dropping",
+                            in_reply_to
+                        );
+                    };
                 }
             };
         }

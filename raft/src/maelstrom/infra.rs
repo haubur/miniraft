@@ -86,23 +86,11 @@ pub fn route_incoming<K, V, B, Cmd>(
     let msg = body.into();
 
     match msg {
-        Message::Client(
-            req @ (ClientMessage::ReadRequest { .. }
-            | ClientMessage::WriteRequest { .. }
-            | ClientMessage::CASRequest { .. }),
-        ) => {
-            eprintln!("forwarding client request message");
+        Message::Client(msg) => {
+            eprintln!("forwarding client message");
             client_tx
-                .send((source, req))
+                .send((source, msg))
                 .expect("client listener should never hang up");
-        }
-        Message::Client(
-            ClientMessage::ReadResponse { .. }
-            | ClientMessage::WriteResponse { .. }
-            | ClientMessage::CASResponse { .. }
-            | ClientMessage::ErrorResponse { .. },
-        ) => {
-            eprintln!("error: responses should never be routed to nodes, only ever to clients");
         }
         Message::Raft(msg) => {
             eprintln!("forwarding raft message");

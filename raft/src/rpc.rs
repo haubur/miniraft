@@ -158,6 +158,18 @@ impl<K, V> ClientMessage<K, V> {
             | ClientMessage::ErrorResponse { id, .. } => *id,
         }
     }
+
+    pub(crate) fn set_id(&mut self, to: MessageID) {
+        match self {
+            ClientMessage::ReadRequest { id, .. }
+            | ClientMessage::WriteRequest { id, .. }
+            | ClientMessage::CASRequest { id, .. }
+            | ClientMessage::ReadResponse { id, .. }
+            | ClientMessage::WriteResponse { id, .. }
+            | ClientMessage::CASResponse { id, .. }
+            | ClientMessage::ErrorResponse { id, .. } => *id = to,
+        }
+    }
 }
 
 impl<C: Serialize> Serialize for RaftMessage<C> {

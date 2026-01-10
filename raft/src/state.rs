@@ -106,8 +106,8 @@ impl<Cmd> Log<Cmd> {
     }
 
     // take ownership but make it read-only
-    fn append(&mut self, entries: Box<[LogEntry<Cmd>]>) {
-        self.inner.extend(entries);
+    fn append(&mut self, entry: LogEntry<Cmd>) {
+        self.inner.push(entry);
     }
 }
 
@@ -773,11 +773,10 @@ impl<S: StateMachine> State<S> {
             }
 
             eprintln!(
-                "replicate log: local size {:?}, sending {} entries to {}: {:?}",
+                "replicate log: local size {:?}, sending {} entries to {}",
                 self.c.log.highest_index(),
                 n_entries,
                 node_id,
-                entries
             );
 
             outgoing
@@ -789,10 +788,10 @@ impl<S: StateMachine> State<S> {
     }
 
     pub(super) fn append(&mut self, cmd: S::Command) {
-        let term = self.c.current_term;
-        self.c
-            .log
-            .append(vec![LogEntry { cmd, term }].into_boxed_slice());
+        self.c.log.append(LogEntry {
+            cmd,
+            term: self.c.current_term,
+        });
     }
 
     /// During leadership, advance the commit index if to the highest possible watermark
