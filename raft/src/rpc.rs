@@ -68,6 +68,11 @@ pub enum RaftMessage<Cmd> {
         ///
         /// Note if appending entries fails, no log update might happen, leaving empty
         /// logs empty, thus having an index is optional.
+        ///
+        /// This field is not mentioned in the Raft paper, but seems to work well,
+        /// allowing peers to send their index *back* instead of the leader having to
+        /// track this state. Raft is not Byzantine fault tolerant, so we trust this
+        /// information.
         index: Option<LogIndex>,
         /// True if follower contained entry matching previous log index and previous
         /// log term.
