@@ -43,11 +43,14 @@ type PeerSender<M> = Sender<PeerMessage<M>>;
 /// Timeout for elections.
 ///
 /// If we do not receive communications within this period, assume there is no leader.
-const ELECTION_TIMEOUT: Duration = Duration::from_secs(2);
+///
+/// Should be a few orders of magnitude less than the expected Mean Time Between
+/// Failures.
+const ELECTION_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Interval at which heartbeats (empty AppendEntries RPCs) are emitted, if no regular
-/// AppendEntries are emitted.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+/// AppendEntries were emitted in the meantime.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Minimum time between log replications emitted from leaders.
 ///
