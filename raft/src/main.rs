@@ -1,25 +1,53 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::path::Path;
 use std::sync::mpsc;
-use std::thread;
+use std::{io, thread};
 
 use raft::Engine;
 use raft::maelstrom::NodeMessageIDGenerator;
 use raft::maelstrom::infra::{read, read_and_handle_init, route_incoming, send};
 use raft::maelstrom::rpc::MessageEnvelope;
+use raft::persistence::Persistent;
 use raft::rpc::Message;
-use raft::state::Persistent;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = String::with_capacity(64);
 
-    let (this_node, mut remote_nodes) = read_and_handle_init(&mut buf)?;
-    remote_nodes.retain(|id| *id != this_node);
+    let (this_node, remote_nodes) = {
+        let (this_node, mut remote_nodes) = read_and_handle_init(&mut buf)?;
+        remote_nodes.retain(|id| *id != this_node);
+        (this_node, remote_nodes) // de-mut
+    };
 
-    // TODO: do not start from scratch on node boot, actually read this off persisted
-    // disk version. Note the command is a "neutral element" of reading a non-existent
-    // key, and responding to no client about it.
-    let p_bytes = br#"{"current_term": 0, "voted_for": null, "log": []}"#;
-    let p = Persistent::restore(&mut p_bytes.as_slice())?;
+    // See if we have existing durable state from past runs. Start from scratch if we
+    // don't. I/O errors outside of the file outright missing are fatal at this stage.
+    let (persistence_file, persistent_state) = {
+        let path = Path::new("./.state/node").join(&this_node);
+        std::fs::create_dir_all(path.parent().expect("has parent"))?;
+        match File::create_new(&path) {
+            Ok(f) => {
+                eprintln!(
+                    "persistence: new empty file at {}",
+                    path.canonicalize()?.to_string_lossy()
+                );
+                (f, Default::default())
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let mut f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)?; // reverse TOCTOU?!
+                let p = Persistent::restore(&mut f)?;
+                eprintln!(
+                    "persistence: restored from {}",
+                    path.canonicalize()?.to_string_lossy()
+                );
+                (f, p)
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
 
     let (raft_incoming_tx, raft_incoming_rx) = mpsc::channel();
     let (raft_outgoing_tx, raft_outgoing_rx) = mpsc::channel();
@@ -27,12 +55,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (client_incoming_tx, client_incoming_rx) = mpsc::channel();
     let (client_outgoing_tx, client_outgoing_rx) = mpsc::channel();
 
-    let raft: Engine<HashMap<u64, i64>> = Engine::new(this_node.clone(), remote_nodes.clone(), p);
+    let raft: Engine<HashMap<u64, i64>> =
+        Engine::new(this_node.clone(), remote_nodes.clone(), persistent_state);
     raft.start(
         raft_incoming_rx,
         raft_outgoing_tx,
         client_incoming_rx,
         client_outgoing_tx,
+        persistence_file,
         NodeMessageIDGenerator,
     );
 
@@ -73,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("thread creation should succeed");
 
     // Handle incoming messages (Raft and KV clients).
-    let mut n = 0;
+    let mut n = 0u64;
     loop {
         n += 1;
         let m: MessageEnvelope<Message<_, _, _>> = read(&mut buf)?;

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::io::Read;
+use std::io::{Seek, Write};
 use std::num::NonZero;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -12,10 +12,12 @@ use json::serde::{Deserialize, Serialize};
 
 use crate::maelstrom::NodeMessageID;
 use crate::maelstrom::rpc::ReservedErrorCode;
+use crate::persistence::{PersistenceError, Persistent};
 use crate::rpc::{ClientMessage, MessageID};
-use crate::state::{PersistenceError, Persistent, State, StateMachine};
+use crate::state::{State, StateMachine};
 
 pub mod maelstrom;
+pub mod persistence;
 pub mod rpc;
 pub mod serde;
 pub mod state;
@@ -63,6 +65,7 @@ const MIN_REPLICATION_INTERVAL: Duration = Duration::from_millis(10);
 /// - translate between client domain (key-value store) and Raft core (generic),
 ///   including for state machine driving
 /// - route Raft responses back to peers and clients
+/// - persist state to durable storage before responding to RPCs
 #[derive(Debug, Clone)]
 pub struct Engine<S: StateMachine> {
     /// Underlying raft state.
@@ -77,18 +80,8 @@ where
     S::Command: Debug,
     S::Command: Deserialize,           // for reading wire messages
     S::Command: Send + Sync + 'static, // for threading
+    S::Command: Serialize,             // for persisting state regularly
 {
-    /// Create a new Raft engine from a reader, from which persisted state will be
-    /// restored.
-    pub fn new_from_src(
-        id: NodeID,
-        node_ids: Vec<NodeID>,
-        persistence_source: &mut impl Read,
-    ) -> Result<Self, PersistenceError> {
-        let state = Persistent::<S::Command>::restore(persistence_source)?;
-        Ok(Self::new(id, node_ids, state))
-    }
-
     /// Create a new Raft engine.
     ///
     /// Does not do anything by itself; call [`Self::start`] afterwards.
@@ -101,7 +94,7 @@ where
         let state = Arc::new(Mutex::new(State::new(id, node_ids, state)));
         Self {
             state,
-            // State is built up from log on each log; start with a fresh machine.
+            // State is built up from log on each boot; start with a fresh machine.
             state_machine: Default::default(),
         }
     }
@@ -115,13 +108,14 @@ where
     /// While running, it accepts client- and Raft-specific messages, and will respond
     /// on the corresponding outgoing channels. It will also put newly created,
     /// non-response messages on the outgoing channels any time it needs.
-    pub fn start<K, V, I>(
+    pub fn start<K, V>(
         self,
         raft_rx: PeerReceiver<rpc::RaftMessage<S::Command>>,
         raft_tx: PeerSender<rpc::RaftMessage<S::Command>>,
         client_rx: PeerReceiver<rpc::ClientMessage<K, V>>,
         client_tx: PeerSender<rpc::ClientMessage<K, V>>,
-        message_ids: I,
+        persist: impl Write + Seek + Send + 'static,
+        message_ids: impl Iterator<Item = NodeMessageID> + Send + 'static,
     ) where
         K: Send + 'static + Debug, // for threading
         V: Send + 'static + Debug, // for threading
@@ -134,7 +128,6 @@ where
             rpc::ClientMessage<K, V>,
             PeerSender<ClientMessage<K, V>>,
         )>,
-        I: Iterator<Item = NodeMessageID> + Send + 'static,
     {
         launch_named_background_task("raft-election-loop", {
             let state = Arc::clone(&self.state);
@@ -153,7 +146,7 @@ where
             let raft_tx = raft_tx.clone();
             // This task is also responsible for driving the state machine forward.
             let mut machine = self.state_machine; // move out + make mutable
-            move || Self::incoming_raft_rpcs_loop(raft_rx, raft_tx, state, &mut machine)
+            move || Self::incoming_raft_rpcs_loop(raft_rx, raft_tx, state, &mut machine, persist)
         });
 
         launch_named_background_task("raft-handle-incoming-client-messages", {
@@ -231,6 +224,7 @@ where
         raft_tx: PeerSender<rpc::RaftMessage<S::Command>>,
         state: Arc<Mutex<State<S>>>,
         machine: &mut S,
+        mut persist: impl Write + Seek,
     ) {
         for (peer, msg) in raft_rx.iter() {
             // Check if another node has a more advanced logical clock.
@@ -244,46 +238,42 @@ where
             // past, replying is still useful (e.g. to vote for an eligible candidate
             // peer).
 
-            match msg {
+            let resp = match msg {
                 rpc::RaftMessage::RequestVote {
                     candidate_term,
                     last_log_index,
                     last_log_term,
-                } => {
-                    let resp = state.lock().expect("no poison").handle_vote_request(
-                        peer.clone(),
-                        candidate_term,
-                        last_log_index,
-                        last_log_term,
+                } => state.lock().expect("no poison").handle_vote_request(
+                    peer.clone(),
+                    candidate_term,
+                    last_log_index,
+                    last_log_term,
+                ),
+                rpc::RaftMessage::RequestVoteResponse { term, vote_granted } => {
+                    state.lock().expect("no poison").handle_vote_response(
+                        peer,
+                        term,
+                        vote_granted,
+                        raft_tx.clone(),
                     );
-                    raft_tx
-                        .send((peer, resp))
-                        .expect("raft message receiver should never hang up");
+
+                    continue; // no "response to response"
                 }
-                rpc::RaftMessage::RequestVoteResponse { term, vote_granted } => state
-                    .lock()
-                    .expect("no poison")
-                    .handle_vote_response(peer, term, vote_granted, raft_tx.clone()),
                 rpc::RaftMessage::AppendEntries {
                     term,
                     commit_index,
                     prev_log_index,
                     prev_log_term,
                     entries,
-                } => {
-                    let resp = state.lock().expect("no poison").handle_append_entries(
-                        peer.clone(),
-                        term,
-                        commit_index,
-                        prev_log_index,
-                        prev_log_term,
-                        entries,
-                        machine,
-                    );
-                    raft_tx
-                        .send((peer, resp))
-                        .expect("raft message receiver should never hang up");
-                }
+                } => state.lock().expect("no poison").handle_append_entries(
+                    peer.clone(),
+                    term,
+                    commit_index,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    machine,
+                ),
                 rpc::RaftMessage::AppendEntriesResponse { index, success, .. } => {
                     state
                         .lock()
@@ -295,8 +285,26 @@ where
                             raft_tx.clone(),
                             machine,
                         );
+
+                    continue; // no "response to response"
                 }
             };
+
+            // Fetch persistable version of state and write out.
+            let p: Persistent<S::Command> = (&*state.lock().expect("no poison")).into();
+            if let Err(e) = persist
+                .rewind() // NB: not incremental, redo all
+                .map_err(PersistenceError::IoError)
+                .and_then(|()| p.persist(&mut persist))
+                .and_then(|()| persist.flush().map_err(PersistenceError::IoError))
+            {
+                eprintln!("error persisting state, refusing RPC response: {e}");
+                continue;
+            }
+
+            raft_tx
+                .send((peer, resp))
+                .expect("raft message receiver should never hang up");
         }
 
         // If we get here we're non-functional due to programming error, blow up and

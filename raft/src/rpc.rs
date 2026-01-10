@@ -1,3 +1,5 @@
+//! Types and implementations (ser/de) for client and Raft RPC.
+//!
 //! See also p. 4 of <https://raft.github.io/raft.pdf>.
 
 use std::collections::HashMap;
