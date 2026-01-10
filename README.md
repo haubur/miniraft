@@ -6,9 +6,10 @@ write, CAS).
 
 - **dependency-free**, stdlib-only Rust
   - [**custom JSON parser**](json/src/lib.rs) and ser/de framework, with OK performance
-    (ballpark of ~220 MB/s throughput on Apple M3 on [complex input (e.g. UTF-16
-    surrogate code pair)](json/benches/bench.rs)) and **full spec compliance**, passing
-    [JSON minefield stress test suite](https://seriot.ch/software/parsing_json.html)
+    (ballpark of ~220 MB/s throughput on Apple M3 on [complex
+    input](json/benches/bench.rs) (UTF-16 surrogate etc.)) and **full spec compliance**,
+    passing [JSON minefield stress test
+    suite](https://seriot.ch/software/parsing_json.html)
   - [base64 non-URL](base64/src/lib.rs)
   - [`rand` helper](rand/src/lib.rs) (Unix only)
 - Raft implementation passes [Jepsen Maelstrom chaos
@@ -23,7 +24,7 @@ write, CAS).
     - focus on correctness: [illegal states made
       unrepresentable](https://cliffle.com/blog/rust-typestate/) levering the type
       system where feasible, and liberal use of `assert`s for pre/post conditions. No
-      `unsafe`, no shenanigans!
+      `unsafe`, no shenanigans
 
 ## Not in the box
 
