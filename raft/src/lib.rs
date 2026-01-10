@@ -171,7 +171,7 @@ where
     fn election_loop(
         raft_tx: PeerSender<rpc::RaftMessage<<S as StateMachine>::Command>>,
         state: Arc<Mutex<State<S>>>,
-    ) -> ! {
+    ) {
         loop {
             state
                 .lock()
