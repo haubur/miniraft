@@ -149,8 +149,8 @@ impl<Cmd> Common<Cmd> {
             node_ids,
 
             // Volatile: rebuild from scratch.
-            commit_index: Default::default(),
-            last_applied: Default::default(),
+            commit_index: None,
+            last_applied: None,
             election_deadline: Instant::now(),
         }
     }
@@ -694,7 +694,10 @@ impl<S: StateMachine> State<S> {
         if let Some(index) = index {
             // Peers send their new _current_ index. Note, this means indexes can go
             // _backwards_ if an outdated response arrives late. We will re-replicate
-            // from an earlier state for that node (wasteful but safe).
+            // from an earlier state to that node (wasteful but safe). If that node has
+            // not crashed meanwhile, its last_applied is still accurate (never goes
+            // backwards) and the re-sent commands will correctly not be re-applied to
+            // its state machine.
             *next_index = index.checked_add(1).expect("should never exceed log size");
             *match_index = Some(index);
             self.advance_commit_index(machine);
