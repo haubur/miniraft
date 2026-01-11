@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Debug, Display};
@@ -18,48 +17,50 @@ use crate::state::{Log, Role, State, StateMachine, Term};
 ///
 /// See also fig. 4 in <https://raft.github.io/raft.pdf>.
 #[derive(Debug, PartialEq)]
-pub struct Persistent<'s, Cmd: Clone> {
-    pub(crate) current_term: Cow<'s, Term>,
-    pub(crate) voted_for: Option<Cow<'s, NodeID>>,
-    pub(crate) log: Cow<'s, Log<Cmd>>,
+pub struct Persistent<Cmd> {
+    pub(crate) current_term: Term,
+    pub(crate) voted_for: Option<NodeID>,
+    pub(crate) log: Log<Cmd>,
 }
 
 /// If no persisted state to restore from exists, allow to start from scratch.
-impl<Cmd: Clone> Default for Persistent<'_, Cmd> {
+impl<Cmd> Default for Persistent<Cmd> {
     fn default() -> Self {
         Self {
-            current_term: Cow::Owned(Term::default()),
+            current_term: Default::default(),
             voted_for: None,
-            log: Cow::Owned(Log { inner: vec![] }),
+            log: Log { inner: vec![] },
         }
     }
 }
 
 /// Convert the current node state to a version suitable for persisting.
-impl<'s, S: StateMachine> From<&'s State<S>> for Persistent<'s, S::Command> {
-    fn from(state: &'s State<S>) -> Self {
+///
+/// NB: full clone, not efficient.
+impl<S: StateMachine> From<&State<S>> for Persistent<S::Command> {
+    fn from(state: &State<S>) -> Self {
         Self {
-            current_term: Cow::Borrowed(&state.c.current_term),
+            current_term: state.c.current_term,
             voted_for: match &state.r {
-                Role::Follower { voted_for, .. } => voted_for.as_ref().map(Cow::Borrowed),
+                Role::Follower { voted_for, .. } => voted_for.clone(),
                 Role::Candidate { votes } => {
                     assert!(
                         votes.contains(&state.c.id),
                         "candidates always vote for themselves"
                     );
-                    Some(Cow::Borrowed(&state.c.id))
+                    Some(state.c.id.clone())
                 }
                 Role::Leader { .. } => {
                     // By implication, must have voted for self to become leader.
-                    Some(Cow::Borrowed(&state.c.id))
+                    Some(state.c.id.clone())
                 }
             },
-            log: Cow::Borrowed(&state.c.log),
+            log: state.c.log.clone(), // Full clone!
         }
     }
 }
 
-impl<C: Serialize + Clone> Serialize for Persistent<'_, C> {
+impl<C: Serialize> Serialize for Persistent<C> {
     fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
         Ok(JSONValue::Object(HashMap::from([
             ("current_term".to_string(), self.current_term.serialize()?),
@@ -69,7 +70,7 @@ impl<C: Serialize + Clone> Serialize for Persistent<'_, C> {
     }
 }
 
-impl<C: Deserialize + Clone> Deserialize for Persistent<'_, C> {
+impl<C: Deserialize> Deserialize for Persistent<C> {
     fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
         if let JSONValue::Object(mut map) = value {
             match (
@@ -144,7 +145,7 @@ impl From<io::Error> for PersistenceError {
     }
 }
 
-impl<Cmd: Serialize + Clone> Persistent<'_, Cmd> {
+impl<Cmd: Serialize> Persistent<Cmd> {
     /// Serializes out to a writer.
     pub fn persist(&self, dest: &mut impl Write) -> Result<(), PersistenceError> {
         let s = self.serialize()?.to_string();
@@ -154,7 +155,7 @@ impl<Cmd: Serialize + Clone> Persistent<'_, Cmd> {
     }
 }
 
-impl<Cmd: Deserialize + Clone> Persistent<'_, Cmd> {
+impl<Cmd: Deserialize> Persistent<Cmd> {
     /// Restores from a reader. The reader is read until EOF.
     pub fn restore(src: &mut impl Read) -> Result<Self, PersistenceError> {
         let mut buf = Vec::with_capacity(1_024);
@@ -172,7 +173,7 @@ mod tests {
     use super::*;
     use crate::state::LogEntry;
 
-    #[derive(Debug, PartialEq, Clone)]
+    #[derive(Debug, PartialEq)]
     struct TestCommand(String);
 
     impl Serialize for TestCommand {
@@ -193,9 +194,9 @@ mod tests {
     #[test]
     fn test_persistent_serialize_deserialize_roundtrip() -> TestResult<()> {
         let there = Persistent {
-            current_term: Cow::Owned(Term(3)),
-            voted_for: Some(Cow::Owned("foo".into())),
-            log: Cow::Owned(Log {
+            current_term: Term(3),
+            voted_for: Some("foo".into()),
+            log: Log {
                 inner: vec![
                     LogEntry {
                         cmd: TestCommand("foo".into()),
@@ -206,7 +207,7 @@ mod tests {
                         term: Term(7),
                     },
                 ],
-            }),
+            },
         };
 
         // In-memory values only

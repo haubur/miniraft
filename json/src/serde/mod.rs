@@ -65,7 +65,6 @@ impl Error for DeserializeError {}
 /// and/or [`TryFrom`] etc. on generic stdlib types is error-prone as it can lead to
 /// infinite recursion. Being explicit with our own traits is much simpler and safer.
 pub mod stddlib_impls {
-    use std::borrow::Cow;
     use std::num::NonZero;
 
     use super::{Deserialize, Serialize};
@@ -248,25 +247,6 @@ pub mod stddlib_impls {
             } else {
                 Ok(Some(T::deserialize(value)?))
             }
-        }
-    }
-
-    impl<'a, T> Serialize for Cow<'a, T>
-    where
-        T: Serialize + Clone,
-    {
-        fn serialize(&self) -> Result<Value, SerializeError> {
-            T::serialize(self)
-        }
-    }
-
-    impl<'a, T> Deserialize for Cow<'a, T>
-    where
-        T: Deserialize + Clone,
-    {
-        fn deserialize(value: Value) -> Result<Self, super::DeserializeError> {
-            // no zero-copy supported.
-            Ok(Cow::Owned(T::deserialize(value)?))
         }
     }
 }

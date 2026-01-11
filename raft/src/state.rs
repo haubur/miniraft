@@ -1,7 +1,6 @@
 //! Note this module has no concept of client requests and state machine implementation
 //! details, such as key-value store requests.
 
-use std::borrow::Cow;
 use std::cmp::{self, Ordering};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Display};
@@ -223,10 +222,10 @@ impl<S: StateMachine> State<S> {
         }: Persistent<<S as StateMachine>::Command>,
     ) -> Self {
         Self {
-            c: Common::new(id, node_ids, current_term.into_owned(), log.into_owned()),
+            c: Common::new(id, node_ids, current_term, log),
             r: Role::Follower {
                 leader: None,
-                voted_for: voted_for.map(Cow::into_owned),
+                voted_for,
             },
         }
     }
