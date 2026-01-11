@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::io::{Seek, Write};
 use std::sync::mpsc::{Receiver, Sender};
@@ -52,6 +52,16 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
 /// replication events; this interval rate limits those events, allowing batching for
 /// better network utilization (1 RPC with N messages over N RPCs with 1 message each).
 const MIN_REPLICATION_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Limit inflight concurrency to this number of most recent proxied requests.
+///
+/// Proxied queries occur when a client contacts a non-leader node, which on behalf of
+/// the client forwards the request to the (suspected) current leader for a response
+/// (transparently to the client).
+///
+/// Note: not specific to core Raft. An optimization to allow any client to contact any
+/// node for a response (Raft is transparent to clients).s
+const MAX_INFLIGHT_PROXIES: usize = 1_024;
 
 /// The engine driving core Raft state, and holding application state in the Raft state
 /// machine.
@@ -341,11 +351,8 @@ where
         )>,
     {
         // Track outstanding proxy requests this Raft node sends on behalf of clients to
-        // current leaders. NB: grows unbounded, stale requests are never cleared
-        // (positive trade-off: allows for maximum correctness, as we never drop
-        // inflight responses no matter the delay). Ideally want a circular buffer here
-        // probably (which can guarantee O(1) memory).
-        let mut proxies = HashMap::with_capacity(512);
+        // current leaders.
+        let mut proxies = BTreeMap::new();
 
         for (client, msg) in client_rx.iter() {
             let response_id = message_ids.next().expect("should never run out of IDs");
@@ -392,6 +399,15 @@ where
 
                     // Proxy to a leader if known.
                     let (node, msg) = if let Some(leader) = leader {
+                        if proxies.len() > MAX_INFLIGHT_PROXIES {
+                            // Full. Make room for this most recent request. Map is
+                            // keyed by monotonically increasing counter, so this drops
+                            // the oldest dangling request; ~least likely to still have
+                            // an interested client waiting.
+                            let (key, _) = proxies.pop_first().expect("just checked");
+                            eprintln!("proxy: full: dropped {key}");
+                        }
+
                         // We might have become a leader by now while working! That's
                         // OK: our proxy will never receive a response and just time
                         // out. To make it safe, ensure we're not routing to ourselves.
@@ -411,14 +427,19 @@ where
                         let original_id = req.id();
                         let forward_id = response_id; // reuse but rename
                         eprintln!(
-                            "proxying to known leader {leader}: {} -> {}",
+                            "proxy: to known leader {leader}: {}({}) -> {}",
+                            client,
                             original_id,
                             forward_id.get()
                         );
 
                         req.set_id(forward_id.get());
-                        let res = proxies.insert(forward_id.get(), (client, original_id));
+
+                        // Note, inserting original ID (u64) first, client name (string)
+                        // second should give better linear scan performance.
+                        let res = proxies.insert(forward_id.get(), (original_id, client));
                         assert!(res.is_none(), "node IDs are unique per process");
+
                         (leader, /* proxy original unchanged */ req)
                     } else {
                         // No (known) leader to proxy to, short-circuit to client
@@ -450,15 +471,20 @@ where
                     | rpc::ClientMessage::CASResponse { in_reply_to, .. }
                     | rpc::ClientMessage::ErrorResponse { in_reply_to, .. }),
                 ) => {
-                    if let Some((original_client, original_id)) = proxies.remove(&in_reply_to) {
+                    // Check if there's a client awaiting this response.
+                    if let Some((original_id, original_client)) = proxies.remove(&in_reply_to) {
+                        eprintln!(
+                            "proxy: responding for {in_reply_to} -> {original_client}({original_id})"
+                        );
                         // Swap back for our own "in reply to"
                         resp.set_id(original_id);
+
                         client_tx
                             .send((original_client, resp))
                             .expect("client message receiver should never hang up");
                     } else {
                         eprintln!(
-                            "received client response without registered interest in reply to {}: dropping",
+                            "proxy: received client response without registered interest in reply to {}: dropping",
                             in_reply_to
                         );
                     };
