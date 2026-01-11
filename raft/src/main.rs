@@ -62,9 +62,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (client_outgoing_tx, client_outgoing_rx) = mpsc::channel();
 
     // Note, the concrete key-value types are set below, **a single time** for the
-    // entire application. They cascade down to everything through generics + type
-    // inference, and are thus easily pluggable (might need to provide ser/de
-    // implementations!) at no performance cost (everything is generic, not `dyn`).
+    // **entire application**. They cascade down everywhere, and are thus easily
+    // pluggable (might need to provide ser/de implementations though) at no performance
+    // cost (generic, not `dyn`). E.g., could be `<String, String>`.
     let raft: Engine<HashMap<u64, i64>> =
         Engine::new(this_node.clone(), remote_nodes.clone(), persistent_state);
     raft.start(
