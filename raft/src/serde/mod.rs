@@ -1,11 +1,25 @@
 //! Ser/de implementations for domain types.
 
 use std::collections::HashMap;
+use std::num::NonZero;
 
 use json::Value as JSONValue;
 use json::serde::{Deserialize, Serialize};
 
-use crate::state::{Log, LogEntry, Term};
+use crate::state::{Log, LogEntry, LogIndex, Term};
+
+impl Serialize for LogIndex {
+    fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {
+        self.0.serialize()
+    }
+}
+
+impl Deserialize for LogIndex {
+    fn deserialize(value: JSONValue) -> Result<Self, json::serde::DeserializeError> {
+        let v: NonZero<u64> = Deserialize::deserialize(value)?;
+        Ok(Self(v))
+    }
+}
 
 impl Serialize for Term {
     fn serialize(&self) -> Result<JSONValue, json::serde::SerializeError> {

@@ -23,3 +23,6 @@ indexing_slicing = "deny"
 todo = "warn"
 unwrap_used = "deny"
 wildcard_imports = "deny"
+
+[profile.release]
+overflow-checks = true

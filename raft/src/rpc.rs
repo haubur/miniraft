@@ -7,8 +7,7 @@ use std::collections::HashMap;
 use json::Value as JSONValue;
 use json::serde::{Deserialize, Serialize};
 
-use crate::LogIndex;
-use crate::state::{Log, Term};
+use crate::state::{Log, LogIndex, Term};
 
 pub(crate) type MessageID = u64;
 

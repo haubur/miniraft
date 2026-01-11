@@ -4,12 +4,12 @@
 use std::cmp::{self, Ordering};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Display};
+use std::num::NonZero;
 use std::time::{Duration, Instant};
 
 use crate::persistence::Persistent;
 use crate::{
-    ELECTION_TIMEOUT, HEARTBEAT_INTERVAL, LogIndex, MIN_REPLICATION_INTERVAL, NodeID, PeerSender,
-    min_log_index, rpc,
+    ELECTION_TIMEOUT, HEARTBEAT_INTERVAL, MIN_REPLICATION_INTERVAL, NodeID, PeerSender, rpc,
 };
 
 /// Abstraction for a state machine, to which Raft applies commands from its log
@@ -18,6 +18,57 @@ pub trait StateMachine: Default + Send + std::fmt::Debug {
     type Command: Debug + Clone; // Need to clone to pull out of log.
 
     fn apply(&mut self, cmd: Self::Command);
+}
+
+/// Index of log entries. Raft is 1-indexed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LogIndex(pub(crate) NonZero<u64>);
+
+/// Get the smallest permissible log index in the 1-indexed Raft model.
+impl Default for LogIndex {
+    fn default() -> Self {
+        Self(NonZero::try_from(1).expect("1 > 0"))
+    }
+}
+
+impl LogIndex {
+    /// Increment the index by 1, returning a new one, invalidating the old one.
+    fn inc(self) -> Self {
+        Self(
+            self.0
+                .checked_add(1)
+                .expect("log length should never exceed architecture limit"),
+        )
+    }
+
+    /// Decrement the index by 1, returning a new one if possible. Invalidates the old
+    /// one.
+    fn dec(self) -> Option<Self> {
+        Some(Self(NonZero::try_from(self.0.get() - 1).ok()?))
+    }
+}
+
+/// For local machine-native, 0-indexed operations. Use with care. Should only be used
+/// directly by [`Log`].
+impl LogIndex {
+    fn to_machine_index(self) -> usize {
+        (self.0.get() - 1)
+            .try_into()
+            .expect("arch should be compatible: log index too large")
+    }
+
+    fn from_machine_index(idx: usize) -> Self {
+        let val: u64 = idx
+            .try_into()
+            .expect("arch should be compatible: log machine index too large");
+        Self(NonZero::try_from(val + 1).expect("at least 1"))
+    }
+}
+
+impl fmt::Display for LogIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
 }
 
 /// An election term.
@@ -62,26 +113,17 @@ pub struct Log<Cmd> {
 impl<Cmd> Log<Cmd> {
     /// Get entry at given index, if any.
     fn get(&self, index: LogIndex) -> Option<&LogEntry<Cmd>> {
-        let index: usize = (index.get() - 1)
-            .try_into()
-            .expect("arch should be compatible");
-        self.inner.get(index)
+        self.inner.get(index.to_machine_index())
     }
 
     /// Get all entries starting from the given entry, if any.
     fn get_from(&self, index: LogIndex) -> Option<&[LogEntry<Cmd>]> {
-        let index: usize = (index.get() - 1)
-            .try_into()
-            .expect("arch should be compatible");
-        self.inner.get(index..)
+        self.inner.get(index.to_machine_index()..)
     }
 
     /// Replace all entries starting at given index with new ones.
     fn replace_from(&mut self, index: LogIndex, with: Box<[LogEntry<Cmd>]>) {
-        let index: usize = (index.get() - 1)
-            .try_into()
-            .expect("arch should be compatible");
-        self.inner.truncate(index);
+        self.inner.truncate(index.to_machine_index());
         self.inner.extend(with);
     }
 
@@ -95,13 +137,9 @@ impl<Cmd> Log<Cmd> {
         if self.inner.is_empty() {
             None
         } else {
-            let len: u64 = self
-                .inner
-                .len()
-                .try_into()
-                .expect("arch should be compatible");
-
-            Some(LogIndex::try_from(len).expect("not empty so len >= 1"))
+            Some(LogIndex::from_machine_index(
+                self.inner.len().checked_sub(1).expect("at least 1 element"),
+            ))
         }
     }
 
@@ -336,10 +374,11 @@ impl<S: StateMachine> State<S> {
                         assert_ne!(id, &self.c.id);
                         (
                             id.clone(),
-                            self.c.log.highest_index().map_or(
-                                min_log_index(), // If log empty
-                                |hi| hi.checked_add(1).expect("should never exceed limit"),
-                            ),
+                            self.c
+                                .log
+                                .highest_index()
+                                .map(|hi| hi.inc()) // One beyond end
+                                .unwrap_or_default(), // If log empty
                         )
                     })
                     .collect(),
@@ -613,10 +652,9 @@ impl<S: StateMachine> State<S> {
         // Consistency check with induction step OK.
 
         self.c.log.replace_from(
-            leader_prev_log_index.map_or(/* wipe it all */ min_log_index(), |idx| {
-                idx.checked_add(1)
-                    .expect("log length should never exceed range")
-            }),
+            leader_prev_log_index
+                .map(|idx| idx.inc())
+                .unwrap_or_default(/* wipe it all */),
             entries.inner.into_boxed_slice(),
         );
 
@@ -674,7 +712,7 @@ impl<S: StateMachine> State<S> {
 
             // Decrement, floor it to minimum permissible index (sending "next index"
             // below that makes no sense).
-            *next_index = LogIndex::try_from(next_index.get() - 1).unwrap_or(min_log_index());
+            *next_index = next_index.dec().unwrap_or_default();
 
             // Retry right away with new decremented value. This can be called anytime,
             // it internally ensures we don't replicate too often.
@@ -698,7 +736,7 @@ impl<S: StateMachine> State<S> {
             // not crashed meanwhile, its last_applied is still accurate (never goes
             // backwards) and the re-sent commands will correctly not be re-applied to
             // its state machine.
-            *next_index = index.checked_add(1).expect("should never exceed log size");
+            *next_index = index.inc();
             *match_index = Some(index);
             self.advance_commit_index(machine);
         }
@@ -755,7 +793,7 @@ impl<S: StateMachine> State<S> {
 
             // See if we can produce a previous log entry, from _before_ the entries
             // slice.
-            let prev_log_index = LogIndex::try_from(next_index_for_node.get() - 1).ok();
+            let prev_log_index = next_index_for_node.dec();
             let prev_log_term =
                 prev_log_index.and_then(|idx| self.c.log.get(idx).map(|entry| entry.term));
 
@@ -850,11 +888,7 @@ impl<S: StateMachine> State<S> {
 
             // Increment
             self.c.last_applied = Some(
-                self.c
-                    .last_applied
-                    .map_or(/* first application: */ min_log_index(), |idx| {
-                        idx.checked_add(1).expect("should never exceed limit")
-                    }),
+                self.c.last_applied.map(|idx| idx.inc()).unwrap_or_default(/* first application! */),
             );
 
             let log_entry = self
