@@ -33,8 +33,13 @@ type PeerSender<M> = Sender<PeerMessage<M>>;
 ///
 /// If we do not receive communications within this period, assume there is no leader.
 ///
-/// Should be a few orders of magnitude less than the expected Mean Time Between
-/// Failures.
+/// Should be a few orders of magnitude **less** than the expected Mean Time Between
+/// Failures (= node crashes) and one order of magnitude **greater** than broadcast time
+/// ("average time it takes a server to send RPCs in parallel to every server in the
+/// cluster and receive their responses").
+///
+/// Note, next to network latency, broadcast time also includes disk I/O, as nodes must
+/// persist state to stable storage before responding to Raft RPCs.
 const ELECTION_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Interval at which heartbeats (empty AppendEntries RPCs) are emitted, if no regular

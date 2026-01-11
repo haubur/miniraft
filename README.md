@@ -30,4 +30,12 @@ write, CAS).
 
 - TCP/HTTP: I/O and [the binary](raft/src/main.rs) are specific to Jepsen
   Maelstrom, but that's just a couple hundred lines
-- async: stdlib-only, so threading is used
+- async: stdlib-only, so threading is used.
+
+  This is implemented asynchronously and non-blocking all the same: client and Raft RPCs
+  can be emitted and received at any time. Awaiting responses to emitted RPCs is
+  asynchronous as well, though messages go into single-receiver queues. That serializes
+  requets, but the necessary mutual exclusion on the core Raft state does so anyway
+  (there is only one lock, which incidentally makes deadlock-freedom much simpler to
+  guarantee!)
+- live cluster configuration changes
