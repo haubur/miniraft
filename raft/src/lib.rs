@@ -297,15 +297,19 @@ where
             };
 
             // Fetch persistable version of state and write out.
-            let p: Persistent<S::Command> = (&*state.lock().expect("no poison")).into();
-            if let Err(e) = persist
-                .rewind() // NB: not incremental, redo all
-                .map_err(PersistenceError::IoError)
-                .and_then(|()| p.persist(&mut persist))
-                .and_then(|()| persist.flush().map_err(PersistenceError::IoError))
             {
-                eprintln!("error persisting state, refusing RPC response: {e}");
-                continue;
+                // NB: Lock held across I/O
+                let _guard = state.lock().expect("no poison");
+                let p: Persistent<'_, S::Command> = (&*_guard).into();
+                if let Err(e) = persist
+                    .rewind() // NB: not incremental, redo all
+                    .map_err(PersistenceError::IoError)
+                    .and_then(|()| p.persist(&mut persist))
+                    .and_then(|()| persist.flush().map_err(PersistenceError::IoError))
+                {
+                    eprintln!("error persisting state, refusing RPC response: {e}");
+                    continue;
+                }
             }
 
             raft_tx
