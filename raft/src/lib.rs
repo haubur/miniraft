@@ -340,11 +340,12 @@ where
             PeerSender<ClientMessage<K, V>>,
         )>,
     {
-        let max_proxies = 128;
-        let mut proxies = HashMap::with_capacity(max_proxies);
-        // Protect this node against unbounded (memory) growth. This _might_ drop
-        // inflight responses as a tradeoff.
-        assert!(proxies.len() <= max_proxies);
+        // Track outstanding proxy requests this Raft node sends on behalf of clients to
+        // current leaders. NB: grows unbounded, stale requests are never cleared
+        // (positive trade-off: allows for maximum correctness, as we never drop
+        // inflight responses no matter the delay). Ideally want a circular buffer here
+        // probably (which can guarantee O(1) memory).
+        let mut proxies = HashMap::with_capacity(512);
 
         for (client, msg) in client_rx.iter() {
             let response_id = message_ids.next().expect("should never run out of IDs");
@@ -391,11 +392,6 @@ where
 
                     // Proxy to a leader if known.
                     let (node, msg) = if let Some(leader) = leader {
-                        if proxies.len() > max_proxies {
-                            eprintln!("clearing proxies");
-                            proxies.clear(); // Make room for this most recent request
-                        }
-
                         // We might have become a leader by now while working! That's
                         // OK: our proxy will never receive a response and just time
                         // out. To make it safe, ensure we're not routing to ourselves.
