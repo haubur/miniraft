@@ -861,7 +861,9 @@ impl<S: StateMachine> State<S> {
         };
 
         if entry.term != self.c.current_term {
-            // TODO: explain why
+            // It is unsafe to advance entries with stale terms: another leader might
+            // emerge and overwrite later on, when it successfully appends _other_
+            // entries. See also section 5.4.2/Fig. 8
             eprintln!("advance commit index: log entry {n} not in current term");
             return;
         }
