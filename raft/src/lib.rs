@@ -173,7 +173,10 @@ where
             state
                 .lock()
                 .expect("no poison")
-                .maybe_begin_election(raft_tx.clone());
+                .maybe_begin_election()
+                .into_iter()
+                .try_for_each(|msg| raft_tx.send(msg))
+                .expect("raft receiver should never hang up");
 
             // Poll as frequently as feasible. Note, the election deadline this monitors
             // can be bumped forward *at any time*, so we cannot just sleep once and
@@ -207,7 +210,10 @@ where
             state
                 .lock()
                 .expect("no poison")
-                .replicate_log(raft_tx.clone());
+                .replicate_log()
+                .into_iter()
+                .try_for_each(|msg| raft_tx.send(msg))
+                .expect("raft receiver should never hang up");
 
             thread::sleep(HEARTBEAT_INTERVAL);
         }
@@ -238,56 +244,46 @@ where
             // past, replying is still useful (e.g. to vote for an eligible candidate
             // peer).
 
-            let resp = match msg {
+            let responses = match msg {
                 rpc::RaftMessage::RequestVote {
                     candidate_term,
                     last_log_index,
                     last_log_term,
-                } => state.lock().expect("no poison").handle_vote_request(
-                    peer.clone(),
-                    candidate_term,
-                    last_log_index,
-                    last_log_term,
-                ),
-                rpc::RaftMessage::RequestVoteResponse { term, vote_granted } => {
-                    state.lock().expect("no poison").handle_vote_response(
+                } => vec![(
+                    peer.clone(), // single receiver: the candidate
+                    state.lock().expect("no poison").handle_vote_request(
                         peer,
-                        term,
-                        vote_granted,
-                        raft_tx.clone(),
-                    );
-
-                    continue; // no "response to response"
-                }
+                        candidate_term,
+                        last_log_index,
+                        last_log_term,
+                    ),
+                )],
+                rpc::RaftMessage::RequestVoteResponse { term, vote_granted } => state
+                    .lock()
+                    .expect("no poison")
+                    .handle_vote_response(peer, term, vote_granted),
                 rpc::RaftMessage::AppendEntries {
                     term,
                     commit_index,
                     prev_log_index,
                     prev_log_term,
                     entries,
-                } => state.lock().expect("no poison").handle_append_entries(
-                    peer.clone(),
-                    term,
-                    commit_index,
-                    prev_log_index,
-                    prev_log_term,
-                    entries,
-                    machine,
-                ),
-                rpc::RaftMessage::AppendEntriesResponse { index, success, .. } => {
-                    state
-                        .lock()
-                        .expect("no poison")
-                        .handle_append_entries_response(
-                            peer,
-                            success,
-                            index,
-                            raft_tx.clone(),
-                            machine,
-                        );
-
-                    continue; // no "response to response"
-                }
+                } => vec![(
+                    peer.clone(), // single receiver: the leader
+                    state.lock().expect("no poison").handle_append_entries(
+                        peer,
+                        term,
+                        commit_index,
+                        prev_log_index,
+                        prev_log_term,
+                        entries,
+                        machine,
+                    ),
+                )],
+                rpc::RaftMessage::AppendEntriesResponse { index, success, .. } => state
+                    .lock()
+                    .expect("no poison")
+                    .handle_append_entries_response(peer, success, index, machine),
             };
 
             // Fetch persistable version of state and write out. Note, we hold ownership
@@ -307,9 +303,10 @@ where
                 continue;
             }
 
-            raft_tx
-                .send((peer, resp))
-                .expect("raft message receiver should never hang up");
+            responses
+                .into_iter()
+                .try_for_each(|msg| raft_tx.send(msg))
+                .expect("raft receiver should never hang up");
         }
 
         // If we get here we're non-functional due to programming error, blow up and
@@ -379,7 +376,10 @@ where
                     state
                         .lock()
                         .expect("no poison")
-                        .replicate_log(raft_tx.clone());
+                        .replicate_log()
+                        .into_iter()
+                        .try_for_each(|msg| raft_tx.send(msg))
+                        .expect("raft receiver should never hang up");
                 }
                 (
                     false, // as non-leader, we might still perform helpful work

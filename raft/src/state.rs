@@ -6,11 +6,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Display};
 use std::num::NonZero;
 use std::time::{Duration, Instant};
+use std::vec;
 
 use crate::persistence::Persistent;
-use crate::{
-    ELECTION_TIMEOUT, HEARTBEAT_INTERVAL, MIN_REPLICATION_INTERVAL, NodeID, PeerSender, rpc,
-};
+use crate::{ELECTION_TIMEOUT, HEARTBEAT_INTERVAL, MIN_REPLICATION_INTERVAL, NodeID, rpc};
 
 /// Abstraction for a state machine, to which Raft applies commands from its log
 /// entries.
@@ -297,21 +296,20 @@ impl<S: StateMachine> State<S> {
     /// > If a follower receives no communication over a period of time called the
     /// > election timeout, then it assumes there is no viable leader and begins an
     /// > election to choose a new leader.
-    pub(super) fn maybe_begin_election(
-        &mut self,
-        outgoing: PeerSender<rpc::RaftMessage<S::Command>>,
-    ) {
+    #[must_use]
+    pub(super) fn maybe_begin_election(&mut self) -> Vec<(NodeID, rpc::RaftMessage<S::Command>)> {
         eprintln!("maybe beginning election");
 
         if !self.election_timeout_passed() {
             eprintln!("election deadline in the future, doing nothing");
-            return;
+            return vec![];
         }
 
         if let Role::Leader { .. } = self.r {
-            self.c.extend_election_deadline()
+            self.c.extend_election_deadline();
+            vec![] // No further communication necessary
         } else {
-            self.become_candidate(outgoing)
+            self.become_candidate()
         }
     }
 
@@ -320,7 +318,8 @@ impl<S: StateMachine> State<S> {
     }
 
     /// Become a candidate and start an election.
-    fn become_candidate(&mut self, outgoing: PeerSender<rpc::RaftMessage<S::Command>>) {
+    #[must_use]
+    fn become_candidate(&mut self) -> Vec<(NodeID, rpc::RaftMessage<S::Command>)> {
         assert!(self.election_timeout_passed());
         eprintln!("becoming candidate and beginning election");
 
@@ -341,7 +340,7 @@ impl<S: StateMachine> State<S> {
         };
 
         eprintln!("became candidate for term {}", self.c.current_term);
-        self.request_votes(outgoing);
+        self.request_votes()
     }
 
     pub(super) fn become_follower(&mut self, voted_for: Option<NodeID>) {
@@ -363,7 +362,8 @@ impl<S: StateMachine> State<S> {
     ///
     /// > When a leader first comes to power, it initializes all nextIndex values to the
     /// > index just after the last one in its log
-    fn become_leader(&mut self, outgoing: PeerSender<rpc::RaftMessage<S::Command>>) {
+    #[must_use]
+    fn become_leader(&mut self) -> Vec<(NodeID, rpc::RaftMessage<S::Command>)> {
         self.r = if let Role::Candidate { .. } = self.r {
             Role::Leader {
                 next_indexes: self
@@ -400,25 +400,28 @@ impl<S: StateMachine> State<S> {
         // > server; repeat during idle periods to prevent election timeouts (§5.2)
         //
         // This helps voters get feedback ASAP.
-        self.replicate_log(outgoing);
+        self.replicate_log()
     }
 
     /// Request votes from *all* other nodes.
-    fn request_votes(&self, outgoing: PeerSender<rpc::RaftMessage<S::Command>>) {
+    #[must_use]
+    fn request_votes(&self) -> Vec<(NodeID, rpc::RaftMessage<S::Command>)> {
         eprintln!("requesting votes for term {}", self.c.current_term);
 
-        for node in &self.c.node_ids {
-            outgoing
-                .send((
+        self.c
+            .node_ids
+            .iter()
+            .map(|node| {
+                (
                     node.clone(),
                     rpc::RaftMessage::RequestVote {
                         candidate_term: self.c.current_term,
                         last_log_index: self.c.log.highest_index(),
                         last_log_term: self.c.log.last().map(|entry| entry.term),
                     },
-                ))
-                .expect("receiver should never hang up");
-        }
+                )
+            })
+            .collect()
     }
 }
 
@@ -513,20 +516,20 @@ impl<S: StateMachine> State<S> {
     /// Handle a response to a previous vote request we sent.
     ///
     /// Note these responses can be arbitrarily delayed and correspondingly malformed.
+    #[must_use]
     pub(super) fn handle_vote_response(
         &mut self,
         peer: NodeID,
         remote_term: Term,
         vote_granted: bool,
-        outgoing: PeerSender<rpc::RaftMessage<S::Command>>,
-    ) {
+    ) -> Vec<(NodeID, rpc::RaftMessage<S::Command>)> {
         eprintln!(
             "handling vote response from {} on term {}, vote granted: {}",
             peer, remote_term, vote_granted
         );
 
         if !vote_granted {
-            return; // Too bad
+            return vec![]; // Too bad
         }
 
         if let Role::Candidate { votes } = &mut self.r {
@@ -547,7 +550,7 @@ impl<S: StateMachine> State<S> {
 
                     let votes_received = votes.len();
                     if self.won_election(votes_received) {
-                        self.become_leader(outgoing);
+                        return self.become_leader();
                     }
                 }
                 Ordering::Greater => {
@@ -562,6 +565,8 @@ impl<S: StateMachine> State<S> {
             // further peers' favorable votes arrived after we already stepped up.
             eprintln!("ignoring vote: not currently a candidate (anymore)");
         };
+
+        vec![]
     }
 
     #[must_use]
@@ -576,7 +581,7 @@ impl<S: StateMachine> State<S> {
     /// If all checks pass, the request is accepted and this node's state machine
     /// progressed to the next indicated commit index.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn handle_append_entries(
         &mut self,
         peer: NodeID,
@@ -684,14 +689,14 @@ impl<S: StateMachine> State<S> {
     ///
     /// If not successful, log replication is immediately retried via the outgoing
     /// channel. If successful, we advance the state machine.
+    #[must_use]
     pub(super) fn handle_append_entries_response(
         &mut self,
         peer: NodeID,
         success: bool,
         index: Option<LogIndex>,
-        outgoing: PeerSender<rpc::RaftMessage<S::Command>>,
         machine: &mut S,
-    ) {
+    ) -> Vec<(NodeID, rpc::RaftMessage<S::Command>)> {
         let Role::Leader {
             next_indexes,
             match_indexes,
@@ -699,12 +704,12 @@ impl<S: StateMachine> State<S> {
         } = &mut self.r
         else {
             eprintln!("ignoring append entries response from {peer}: no longer a leader");
-            return;
+            return vec![];
         };
 
         let Some(next_index) = next_indexes.get_mut(&peer) else {
             eprintln!("ignoring append entries response from {peer}: no tracking next index entry");
-            return;
+            return vec![];
         };
 
         if !success {
@@ -716,16 +721,14 @@ impl<S: StateMachine> State<S> {
 
             // Retry right away with new decremented value. This can be called anytime,
             // it internally ensures we don't replicate too often.
-            self.replicate_log(outgoing);
-
-            return;
+            return self.replicate_log();
         }
 
         let Some(match_index) = match_indexes.get_mut(&peer) else {
             eprintln!(
                 "ignoring append entries response from {peer}: no tracking match index entry"
             );
-            return;
+            return vec![];
         };
 
         eprintln!("append entries: successful, indexes to {index:?} for {peer}");
@@ -743,6 +746,8 @@ impl<S: StateMachine> State<S> {
         // Note we ignore peers sending None for their new index, which is valid when
         // bootstrapping from empty and sending an empty heartbeat. Peers will respond
         // with success but there's no logs still.
+
+        vec![] // OK, do not send response to response
     }
 }
 
@@ -751,7 +756,8 @@ impl<S: StateMachine> State<S> {
 impl<S: StateMachine> State<S> {
     /// During leadership, replicate local log to all relevant peers, potentially
     /// sending an empty replication request for heartbeat.
-    pub(super) fn replicate_log(&mut self, outgoing: PeerSender<rpc::RaftMessage<S::Command>>) {
+    #[must_use]
+    pub(super) fn replicate_log(&mut self) -> Vec<(NodeID, rpc::RaftMessage<S::Command>)> {
         let Role::Leader {
             next_indexes,
             last_replication,
@@ -759,14 +765,14 @@ impl<S: StateMachine> State<S> {
         } = &mut self.r
         else {
             eprintln!("replicate log: not a leader");
-            return;
+            return vec![];
         };
 
         let heartbeat_needed = if let Some(lr) = last_replication {
             let elapsed = Instant::now() - *lr;
             if elapsed < MIN_REPLICATION_INTERVAL {
                 eprintln!("replicate log: last replication too recently, skipping");
-                return;
+                return vec![];
             }
 
             let v = elapsed > HEARTBEAT_INTERVAL;
@@ -777,6 +783,7 @@ impl<S: StateMachine> State<S> {
             true
         };
 
+        let mut msgs = Vec::with_capacity(self.c.node_ids.len());
         for node_id in &self.c.node_ids {
             let next_index_for_node = next_indexes
                 .get(node_id)
@@ -819,12 +826,12 @@ impl<S: StateMachine> State<S> {
                 node_id,
             );
 
-            outgoing
-                .send((node_id.clone(), msg))
-                .expect("raft receiver should never hang up");
+            msgs.push((node_id.clone(), msg));
 
             *last_replication = Some(Instant::now());
         }
+
+        msgs
     }
 
     pub(super) fn append(&mut self, cmd: S::Command) {
