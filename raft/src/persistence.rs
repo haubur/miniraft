@@ -36,7 +36,10 @@ impl<Cmd> Default for Persistent<Cmd> {
 
 /// Convert the current node state to a version suitable for persisting.
 ///
-/// NB: full clone, not efficient.
+/// Note, full ownership of state data is attained through cloning. While expensive in
+/// terms of memory, this allows persistence to proceed without taking a lock on the
+/// state across I/O operations (which can take ~unbounded time -- we don't control).
+/// That frees the node to keep processing in other threads.
 impl<S: StateMachine> From<&State<S>> for Persistent<S::Command> {
     fn from(state: &State<S>) -> Self {
         Self {

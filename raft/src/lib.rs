@@ -296,7 +296,12 @@ where
                 }
             };
 
-            // Fetch persistable version of state and write out.
+            // Fetch persistable version of state and write out. Note, we hold ownership
+            // over the persistence destination and access it sequentially only: no risk
+            // of concurrent writers conflicting, guaranteed by the type system
+            // (assuming, if persistence destination is a file, no other file handles
+            // are open to it, outside our little universe here, but we don't control
+            // that).
             let p: Persistent<S::Command> = (&*state.lock().expect("no poison")).into();
             if let Err(e) = persist
                 .rewind() // NB: not incremental, redo all
