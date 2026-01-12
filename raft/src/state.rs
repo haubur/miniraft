@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use std::vec;
 
 use crate::persistence::Persistent;
+use crate::state::stats::Stats;
 use crate::{ELECTION_TIMEOUT, HEARTBEAT_INTERVAL, MIN_REPLICATION_INTERVAL, NodeID, rpc};
 
 /// Abstraction for a state machine, to which Raft applies commands from its log
@@ -142,7 +143,6 @@ impl<Cmd> Log<Cmd> {
         }
     }
 
-    // take ownership but make it read-only
     fn append(&mut self, entry: LogEntry<Cmd>) {
         self.inner.push(entry);
     }
@@ -925,6 +925,69 @@ impl<S: StateMachine> State<S> {
         } else {
             None
         }
+    }
+
+    /// Pull stats on current internal engine state.
+    #[must_use]
+    pub(crate) fn stats(&self) -> Stats {
+        Stats {
+            role: (&self.r).into(),
+            term: self.c.current_term,
+            voted_for: if let Role::Follower { voted_for, .. } = &self.r {
+                voted_for.clone()
+            } else {
+                None
+            },
+            log_size: self.c.log.highest_index(),
+            commit_index: self.c.commit_index,
+            last_applied: self.c.last_applied,
+        }
+    }
+}
+
+pub(crate) mod stats {
+    use std::fmt;
+
+    use crate::NodeID;
+    use crate::state::{LogIndex, Term};
+
+    /// A minimal version of role state.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub enum Role {
+        #[default]
+        Follower,
+        Candidate,
+        Leader,
+    }
+
+    impl fmt::Display for Role {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Role::Follower => write!(f, "follower"),
+                Role::Candidate => write!(f, "candidate"),
+                Role::Leader => write!(f, "leader"),
+            }
+        }
+    }
+
+    impl From<&super::Role> for Role {
+        fn from(r: &super::Role) -> Self {
+            match r {
+                super::Role::Follower { .. } => Self::Follower,
+                super::Role::Candidate { .. } => Self::Candidate,
+                super::Role::Leader { .. } => Self::Leader,
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    pub struct Stats {
+        pub role: Role,
+        pub term: Term,
+        pub voted_for: Option<NodeID>,
+        pub log_size: Option<LogIndex>,
+        pub commit_index: Option<LogIndex>,
+        pub last_applied: Option<LogIndex>,
     }
 }
 

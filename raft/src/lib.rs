@@ -12,7 +12,7 @@ use json::serde::{Deserialize, Serialize};
 
 use crate::maelstrom::NodeMessageID;
 use crate::maelstrom::rpc::ReservedErrorCode;
-use crate::metrics::{Gauge, InflightProxyRequestsLabels};
+use crate::metrics::{Gauge, InflightProxyRequestsLabels, StateMetricsLabels};
 use crate::persistence::{PersistenceError, Persistent};
 use crate::rpc::{ClientMessage, MessageID};
 use crate::state::{State, StateMachine};
@@ -65,6 +65,9 @@ const MIN_REPLICATION_INTERVAL: Duration = Duration::from_millis(5);
 /// Note: not specific to core Raft. An optimization to allow any client to contact any
 /// node for a response (Raft is transparent to clients).s
 const MAX_INFLIGHT_PROXIES: usize = 1_024;
+
+/// Interval at which to collect Raft statistics, e.g. for metrics collection.
+const STATS_COLLECTION_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The engine driving core Raft state, and holding application state in the Raft state
 /// machine.
@@ -168,9 +171,10 @@ where
             let state = Arc::clone(&self.state);
             let client_tx = client_tx.clone();
             let raft_tx = raft_tx.clone();
+            let node_id = self.id.clone();
             move || {
                 Self::incoming_client_rpcs_loop(
-                    self.id.clone(),
+                    node_id,
                     client_rx,
                     client_tx,
                     raft_tx,
@@ -178,6 +182,12 @@ where
                     message_ids,
                 )
             }
+        });
+
+        launch_named_background_task("raft-metrics-collect-stats", {
+            let state = Arc::clone(&self.state);
+            let node_id = self.id.clone();
+            move || Self::stats_collection_loop(node_id, state)
         });
 
         launch_named_background_task("raft-metrics-server", || metrics::http::serve(metrics_addr));
@@ -520,6 +530,25 @@ where
         // If we get here we're non-functional due to programming error, blow up and
         // start over.
         panic!("client requests sender should never hang up");
+    }
+
+    /// Collect stats on internal Raft state, forever.
+    ///
+    /// An alternative is to be more granular, using atomics to increment e.g. log size
+    /// whenever appropriate. That's more efficient, lock-free, but more effort and more
+    /// error-prone. Stop-the-world global gathering is quick, guaranteed to be
+    /// accurate and keeps reporting in idle periods.
+    fn stats_collection_loop(node_id: NodeID, state: Arc<Mutex<State<S>>>) {
+        loop {
+            metrics::StateMetrics::set(
+                state.lock().expect("no poison").stats(),
+                StateMetricsLabels {
+                    node: node_id.clone(),
+                },
+            );
+
+            thread::sleep(STATS_COLLECTION_INTERVAL);
+        }
     }
 }
 

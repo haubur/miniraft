@@ -12,11 +12,13 @@ write, CAS).
     suite](https://seriot.ch/software/parsing_json.html)
   - [base64 non-URL](base64/src/lib.rs)
   - [`rand` helper](rand/src/lib.rs) (Unix only)
-  - [Prometheus-style metrics](raft/src/metrics/mod.rs) with a simple HTTP/1.1 server
+  - [Prometheus-style metrics](raft/src/metrics/mod.rs)
+    ([example](docs/images/term-metrics.png); `n1` stepping its term during a partition)
+    with a simple HTTP/1.1 server
 - Raft implementation passes [Jepsen Maelstrom chaos
   testing](https://github.com/jepsen-io/maelstrom), for the [**linearizable** KV
   workload](docs/images/raft-kv-latencies-under-network-partition.png) (the failures in
-  the graph are expected for linearizability)
+  the graph are expected, it is Jepsen probing for linearizability)
     - **fully generic (literally and design-wise) core Raft**: applicable to _any_
       workload backable by Raft; the core just holds opaque commands in its log, with an
       abstract state machine dependency-injected for committing into
