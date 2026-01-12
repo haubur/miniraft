@@ -1,0 +1,14 @@
+global:
+  scrape_interval: 1s
+  evaluation_interval: 1s
+
+scrape_configs:
+  - job_name: raft-nodes
+    static_configs:
+      - targets:
+          # NB: needs manual extension when adding more nodes
+          - host.docker.internal:11000
+          - host.docker.internal:11001
+          - host.docker.internal:11002
+          - host.docker.internal:11003
+          - host.docker.internal:11004

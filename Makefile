@@ -24,7 +24,7 @@ build:
 
 # Run the Maelstrom test
 # Use like: make run NODES=5 TIME_LIMIT=60
-run: build
+run: build docker-compose
 	rm -rf $(TMP_DIR)
 	mkdir -p $(TMP_DIR)
 	_JAVA_OPTIONS="-Djava.io.tmpdir=$(CURDIR)/$(TMP_DIR)" maelstrom test \
@@ -40,3 +40,6 @@ run: build
 
 bench:
 	cargo +nightly bench
+
+docker-compose:
+	docker compose up --detach

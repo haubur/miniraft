@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::io::{Seek, Write};
+use std::net::ToSocketAddrs;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -11,15 +12,17 @@ use json::serde::{Deserialize, Serialize};
 
 use crate::maelstrom::NodeMessageID;
 use crate::maelstrom::rpc::ReservedErrorCode;
+use crate::metrics::{Gauge, InflightProxyRequestsLabels};
 use crate::persistence::{PersistenceError, Persistent};
 use crate::rpc::{ClientMessage, MessageID};
 use crate::state::{State, StateMachine};
 
 pub mod maelstrom;
+mod metrics;
 pub mod persistence;
 pub mod rpc;
-pub mod serde;
-pub mod state;
+mod serde;
+mod state;
 
 /// Identifier for nodes in the cluster.
 type NodeID = String;
@@ -79,6 +82,8 @@ pub struct Engine<S: StateMachine> {
     state: Arc<Mutex<State<S>>>,
     /// State machine holding current application state.
     state_machine: S,
+    /// This node's ID.
+    id: NodeID,
 }
 
 impl<S> Engine<S>
@@ -98,11 +103,12 @@ where
             "cluster IDs should not contain self"
         );
 
-        let state = Arc::new(Mutex::new(State::new(id, node_ids, state)));
+        let state = Arc::new(Mutex::new(State::new(id.clone(), node_ids, state)));
         Self {
             state,
             // State is built up from log on each boot; start with a fresh machine.
             state_machine: Default::default(),
+            id,
         }
     }
 
@@ -115,6 +121,7 @@ where
     /// While running, it accepts client- and Raft-specific messages, and will respond
     /// on the corresponding outgoing channels. It will also put newly created,
     /// non-response messages on the outgoing channels any time it needs.
+    #[expect(clippy::too_many_arguments)]
     pub fn start<K, V>(
         self,
         raft_rx: PeerReceiver<rpc::RaftMessage<S::Command>>,
@@ -123,6 +130,7 @@ where
         client_tx: PeerSender<rpc::ClientMessage<K, V>>,
         persist: impl Write + Seek + Send + 'static,
         message_ids: impl Iterator<Item = NodeMessageID> + Send + 'static,
+        metrics_addr: impl ToSocketAddrs + Send + 'static,
     ) where
         K: Send + 'static + Debug, // for threading
         V: Send + 'static + Debug, // for threading
@@ -161,9 +169,18 @@ where
             let client_tx = client_tx.clone();
             let raft_tx = raft_tx.clone();
             move || {
-                Self::incoming_client_rpcs_loop(client_rx, client_tx, raft_tx, state, message_ids)
+                Self::incoming_client_rpcs_loop(
+                    self.id.clone(),
+                    client_rx,
+                    client_tx,
+                    raft_tx,
+                    state,
+                    message_ids,
+                )
             }
         });
+
+        launch_named_background_task("raft-metrics-server", || metrics::http::serve(metrics_addr));
     }
 
     /// Run the election loop, sleeping randomly between checks if a new election term
@@ -335,6 +352,7 @@ where
     ///
     /// - if any channel's other end closes
     fn incoming_client_rpcs_loop<K, V>(
+        node_id: NodeID,
         client_rx: PeerReceiver<rpc::ClientMessage<K, V>>,
         client_tx: PeerSender<rpc::ClientMessage<K, V>>,
         raft_tx: PeerSender<rpc::RaftMessage<S::Command>>,
@@ -356,6 +374,13 @@ where
 
         for (client, msg) in client_rx.iter() {
             let response_id = message_ids.next().expect("should never run out of IDs");
+
+            metrics::InflightProxyRequests::set(
+                proxies.len(),
+                InflightProxyRequestsLabels {
+                    node: node_id.clone(),
+                },
+            );
 
             // Copy bool out of lock, drop lock again ASAP.
             let is_leader = state.lock().expect("no poison").is_leader();
@@ -498,9 +523,11 @@ where
     }
 }
 
-fn launch_named_background_task<F>(name: &str, f: F)
+fn launch_named_background_task<F, T>(name: &str, f: F)
 where
-    F: FnOnce() + Send + 'static,
+    F: FnOnce() -> T,
+    F: Send + 'static,
+    T: Send + 'static,
 {
     thread::Builder::new()
         .name(name.into())

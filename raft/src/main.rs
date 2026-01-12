@@ -61,6 +61,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This node contacting cluster clients (at any time)
     let (client_outgoing_tx, client_outgoing_rx) = mpsc::channel();
 
+    let metrics_addr = (
+        "127.0.0.1",
+        11_000
+            + this_node
+                .strip_prefix(|c: char| !c.is_numeric())
+                .ok_or("need node name with numeric component for stable metrics port")?
+                .parse::<u16>()?,
+    );
+
     // Note, the concrete key-value types are set below, **a single time** for the
     // **entire application**. They cascade down everywhere, and are thus easily
     // pluggable (might need to provide ser/de implementations though) at no performance
@@ -74,6 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_outgoing_tx,
         persistence_file,
         NodeMessageIDGenerator,
+        metrics_addr,
     );
 
     // Handle outgoing Raft messages

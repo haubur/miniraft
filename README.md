@@ -12,6 +12,7 @@ write, CAS).
     suite](https://seriot.ch/software/parsing_json.html)
   - [base64 non-URL](base64/src/lib.rs)
   - [`rand` helper](rand/src/lib.rs) (Unix only)
+  - [Prometheus-style metrics](raft/src/metrics/mod.rs) with a simple HTTP/1.1 server
 - Raft implementation passes [Jepsen Maelstrom chaos
   testing](https://github.com/jepsen-io/maelstrom), for the [**linearizable** KV
   workload](docs/images/raft-kv-latencies-under-network-partition.png) (the failures in
