@@ -15,7 +15,7 @@ use crate::maelstrom::rpc::ReservedErrorCode;
 use crate::metrics::{Gauge, InflightProxyRequestsLabels, StateMetricsLabels};
 use crate::persistence::{PersistenceError, Persistent};
 use crate::rpc::{ClientMessage, MessageID};
-use crate::state::{State, StateMachine};
+use crate::state::{Dismiss, State, StateMachine};
 
 pub mod maelstrom;
 mod metrics;
@@ -663,6 +663,36 @@ pub struct Command<K, V> {
     in_reply_to: Option<MessageID>,
     client: Option<NodeID>,
     respond: Option<PeerSender<rpc::ClientMessage<K, V>>>,
+}
+
+/// Dropping [`Command`] drops its contained channel as well. Clients would wait forever
+/// and never receive a response. Best effort, let us try and inform clients they can
+/// stop waiting: the command is being dropped and will never be applied to the state
+/// machine.
+impl<K, V> Dismiss for Command<K, V> {
+    fn dismiss(&mut self) {
+        let (Some(response_id), Some(in_reply_to), Some(client), Some(chan)) = (
+            self.response_id,
+            self.in_reply_to,
+            &self.client,
+            &self.respond,
+        ) else {
+            // This is best-effort.
+            eprintln!("dismissing: not all reply fields available, skipping");
+            return;
+        };
+
+        eprintln!("dismissing: command can never receive valid response");
+        let resp = rpc::ClientMessage::ErrorResponse {
+            in_reply_to,
+            id: response_id,
+            code: ReservedErrorCode::Abort.into(),
+            text: "dismissing command".into(),
+        };
+
+        chan.send((client.clone(), resp))
+            .expect("client response receiver should never hang up");
+    }
 }
 
 impl<K, V>

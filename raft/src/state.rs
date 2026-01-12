@@ -15,9 +15,24 @@ use crate::{ELECTION_TIMEOUT, HEARTBEAT_INTERVAL, MIN_REPLICATION_INTERVAL, Node
 /// Abstraction for a state machine, to which Raft applies commands from its log
 /// entries.
 pub trait StateMachine: Default + Send + std::fmt::Debug {
-    type Command: Debug + Clone; // Need to clone to pull out of log.
+    type Command: Debug + Clone + Dismiss; // Need to clone to pull out of log.
 
     fn apply(&mut self, cmd: Self::Command);
+}
+
+/// Allows dismissing a command when dropping it from the log.
+///
+/// Dropping a command from the log implies it will never get applied to the
+/// [`StateMachine`] anymore. Dismissal is a hook to inform the command of this
+/// situation, allowing it to react before being dropped (in the actual Rust [`Drop`]
+/// sense).
+///
+/// This is almost like [`Drop`], but the latter has important restrictions which make
+/// it unusable and/or too implicit.
+///
+/// Log truncation can happen on leadership changes.
+pub trait Dismiss {
+    fn dismiss(&mut self);
 }
 
 /// Index of log entries. Raft is 1-indexed.
@@ -110,7 +125,7 @@ pub struct Log<Cmd> {
     pub(crate) inner: Vec<LogEntry<Cmd>>,
 }
 
-impl<Cmd> Log<Cmd> {
+impl<Cmd: Dismiss> Log<Cmd> {
     /// Get entry at given index, if any.
     fn get(&self, index: LogIndex) -> Option<&LogEntry<Cmd>> {
         self.inner.get(index.to_machine_index())
@@ -121,9 +136,11 @@ impl<Cmd> Log<Cmd> {
         self.inner.get(index.to_machine_index()..)
     }
 
-    /// Replace all entries starting at given index with new ones.
+    /// Replace all entries starting at given index with new ones, dismissing replaced
+    /// commands.
     fn replace_from(&mut self, index: LogIndex, with: Box<[LogEntry<Cmd>]>) {
-        self.inner.truncate(index.to_machine_index());
+        let dismissed = self.inner.drain(index.to_machine_index()..);
+        dismissed.for_each(|mut entry| entry.cmd.dismiss());
         self.inner.extend(with);
     }
 
