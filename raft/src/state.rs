@@ -136,12 +136,53 @@ impl<Cmd: Dismiss> Log<Cmd> {
         self.inner.get(index.to_machine_index()..)
     }
 
-    /// Replace all entries starting at given index with new ones, dismissing replaced
-    /// commands.
-    fn replace_from(&mut self, index: LogIndex, with: Box<[LogEntry<Cmd>]>) {
-        let dismissed = self.inner.drain(index.to_machine_index()..);
-        dismissed.for_each(|mut entry| entry.cmd.dismiss());
-        self.inner.extend(with);
+    /// Replace log entries starting at given index with new ones, dismissing replaced
+    /// commands. Log entries are only replaced if they conflict with new ones (same
+    /// index, different term).
+    ///
+    /// Cf. Figure 2:
+    ///
+    /// > 3. If an existing entry conflicts with a new one (same index but different
+    /// >    terms), delete the existing entry and all that follow it (§5.3)
+    /// > 4. Append any new entries not already in the log
+    fn replace_from(&mut self, mut index: LogIndex, with: Box<[LogEntry<Cmd>]>) {
+        let Some(tail) = self.get_from(index) else {
+            // Requested index too high, would leave a gap.
+            eprintln!("error replacing log: out of bounds");
+            return;
+        };
+
+        let mut tail = tail.iter();
+        let mut with = with.into_iter();
+        loop {
+            // Note, tail could be empty, at which point this fires on first iteration.
+            let Some(t) = tail.next() else {
+                // Tail ended, add remaining entries to be added, if any.
+                self.inner.extend(with);
+                return;
+            };
+
+            let Some(w) = with.next() else {
+                // Entries to add exhausted, we are done. Note we do not truncate the
+                // tail: we will deal with that on the next call, if any.
+                //
+                // Note, on heartbeats there's no entries to add, at which point this
+                // fires on first iteration.
+                return;
+            };
+
+            if t.term != w.term {
+                // Same index, different term: a conflict. Wipe our log.
+                let dismissed = self.inner.drain(index.to_machine_index()..);
+                dismissed.for_each(|mut entry| entry.cmd.dismiss());
+
+                self.inner.push(w); // Put back
+                self.inner.extend(with);
+                return;
+            }
+
+            index = index.inc();
+        }
     }
 
     /// Gets the last log entry, if any.
@@ -1022,6 +1063,151 @@ fn lower_median<T: Ord>(items: &mut [T]) -> Option<&T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, PartialEq)]
+    struct TestCommand {
+        val: i64,
+    }
+
+    impl Dismiss for TestCommand {
+        fn dismiss(&mut self) {}
+    }
+
+    fn make_index(i: u64) -> LogIndex {
+        LogIndex(NonZero::new(i).unwrap())
+    }
+
+    fn make_entry(term: u64, val: i64) -> LogEntry<TestCommand> {
+        LogEntry {
+            cmd: TestCommand { val },
+            term: Term(term),
+        }
+    }
+
+    fn make_entries(entries: impl IntoIterator<Item = (u64, i64)>) -> Box<[LogEntry<TestCommand>]> {
+        entries
+            .into_iter()
+            .map(|(term, val)| make_entry(term, val))
+            .collect()
+    }
+
+    fn make_log(entries: impl IntoIterator<Item = (u64, i64)>) -> Log<TestCommand> {
+        Log {
+            inner: make_entries(entries).into_vec(),
+        }
+    }
+
+    #[test]
+    fn test_log_replace_from_none_to_none() {
+        let mut log = make_log([]);
+        log.replace_from(make_index(1), make_entries([]));
+        assert_eq!(log, make_log([]));
+    }
+
+    #[test]
+    fn test_log_replace_from_none_to_single() {
+        let mut log = make_log([]);
+        log.replace_from(make_index(1), make_entries([(1, -1)]));
+        assert_eq!(log, make_log([(1, -1)]));
+    }
+
+    #[test]
+    fn test_log_replace_from_single_to_none_aka_heartbeat() {
+        // This occurs when we have a log just fine and leader sends a heartbeat aka
+        // empty entries. Completely fine!
+        let mut log = make_log([(1, 1_000)]);
+        log.replace_from(make_index(1), make_entries([]));
+        assert_eq!(log, make_log([(1, 1_000)]));
+    }
+
+    #[test]
+    fn test_log_replace_from_single_to_single_same_term() {
+        let mut log = make_log([(1, 1_000)]);
+        log.replace_from(make_index(1), make_entries([(1, -1)]));
+        // Terms were identical so no replacement
+        assert_eq!(log, make_log([(1, 1_000)]));
+    }
+
+    #[test]
+    fn test_log_replace_from_single_to_many_same_term() {
+        let mut log = make_log([(1, 1_000)]);
+        log.replace_from(make_index(1), make_entries([(1, -1), (1, -2)]));
+        // Terms were identical so no replacement, only append
+        assert_eq!(log, make_log([(1, 1_000), (1, -2)]));
+    }
+
+    #[test]
+    fn test_log_replace_from_many_to_many_same_term() {
+        let mut log = make_log([(1, 1_000), (1, 1_001)]);
+        log.replace_from(make_index(1), make_entries([(1, -1), (1, -2)]));
+        // Terms were identical so no replacement
+        assert_eq!(log, make_log([(1, 1_000), (1, 1_001)]));
+    }
+
+    #[test]
+    fn test_log_replace_from_single_to_single_different_term() {
+        let mut log = make_log([(1, 1_000)]);
+        log.replace_from(make_index(1), make_entries([(2, -1)]));
+        // Different term so replacement was forced
+        assert_eq!(log, make_log([(2, -1)]));
+    }
+
+    #[test]
+    fn test_log_replace_from_single_to_many_different_term() {
+        let mut log = make_log([(1, 1_000)]);
+        log.replace_from(make_index(1), make_entries([(2, -1), (2, -2)]));
+        // Different term so replacement was forced
+        assert_eq!(log, make_log([(2, -1), (2, -2)]));
+    }
+
+    #[test]
+    fn test_log_replace_from_many_to_many_different_term_middle_of_log() {
+        let mut log = make_log([
+            (1, 1_000),
+            (1, 1_001),
+            (1, 1_002),
+            (1, 1_003),
+            (1, 1_004),
+            (1, 1_005),
+        ]);
+        log.replace_from(make_index(3), make_entries([(2, -1), (2, -2)]));
+        // Different term so replacement was forced, including ALL SUBSEQUENT entries.
+        assert_eq!(log, make_log([(1, 1_000), (1, 1_001), (2, -1), (2, -2),]));
+    }
+
+    #[test]
+    fn test_log_replace_from_many_to_many_same_term_middle_of_log() {
+        let mut log = make_log([
+            (1, 1_000),
+            (1, 1_001),
+            (1, 1_002),
+            (1, 1_003),
+            (1, 1_004),
+            (1, 1_005),
+        ]);
+        log.replace_from(make_index(3), make_entries([(1, -1), (1, -2)]));
+        // Different term so no replacement, subsequent entries remain in place: they
+        // could be valid in the future.
+        assert_eq!(
+            log,
+            make_log([
+                (1, 1_000),
+                (1, 1_001),
+                (1, 1_002),
+                (1, 1_003),
+                (1, 1_004),
+                (1, 1_005),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_log_replace_conflict_after_match() {
+        let mut log = make_log([(1, 1_000), (1, 1_001), (1, 1_002)]);
+        log.replace_from(make_index(1), make_entries([(1, -1), (2, -2)]));
+        // First entry matches (term 1), second conflicts (term 2) -> truncate from index 2
+        assert_eq!(log, make_log([(1, 1_000), (2, -2)]));
+    }
 
     #[test]
     fn test_median() {
