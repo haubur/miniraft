@@ -1,52 +1,48 @@
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
+use std::fs::{self};
+use std::io::{Cursor, ErrorKind};
 use std::path::Path;
 use std::sync::mpsc;
-use std::{io, thread};
+use std::thread;
 
-use raft::Engine;
 use raft::maelstrom::NodeMessageIDGenerator;
-use raft::maelstrom::infra::{read, read_and_handle_init, route_incoming, send};
+use raft::maelstrom::infra::{read, route_incoming, send};
 use raft::maelstrom::rpc::MessageEnvelope;
 use raft::persistence::{FileMoF, Persistent};
 use raft::rpc::Message;
+use raft::{Engine, supervisor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut buf = String::with_capacity(64);
-
-    let (this_node, remote_nodes) = {
-        let (this_node, mut remote_nodes) = read_and_handle_init(&mut buf)?;
-        remote_nodes.retain(|id| *id != this_node);
-        (this_node, remote_nodes) // de-mut
-    };
+    let (this_node, peers) = supervisor::gate(std::env::vars_os())?;
+    eprintln!("process: passed gate: this node: {this_node}, peers: {peers:?}");
 
     // See if we have existing durable state from past runs. Start from scratch if we
     // don't. I/O errors outside of the file outright missing are fatal at this stage.
     let (persistence_path, persistent_state) = {
-        let path = Path::new("./.state/node").join(&this_node);
+        let path = Path::new("./node").join(&this_node);
+
         std::fs::create_dir_all(path.parent().expect("has parent"))?;
-        match File::create_new(&path) {
-            Ok(_) => {
-                eprintln!(
-                    "persistence: new empty file at {}",
-                    path.canonicalize()?.to_string_lossy()
-                );
+
+        eprintln!("persistence: checking path {}", path.to_string_lossy());
+        match fs::read_to_string(&path) {
+            Ok(s) if s.is_empty() => {
+                // Might happen if it was created but never initially written to before
+                // crashing.
+                eprintln!("persistence: restore: file exists but empty");
                 (path, Persistent::default())
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                let f = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&path)?; // reverse TOCTOU?!
-                let p_state = Persistent::restore(&mut BufReader::new(f))?;
-                eprintln!(
-                    "persistence: restored from {}",
-                    path.canonicalize()?.to_string_lossy()
-                );
-                (path, p_state)
+            Ok(s) => {
+                eprintln!("persistence: restore: reading from file");
+                (path, Persistent::restore(&mut Cursor::new(s))?)
             }
-            Err(e) => return Err(e.into()),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                eprintln!("persistence: restore: file does not exist");
+                (path, Persistent::default())
+            }
+            Err(e) => {
+                eprintln!("persistence: restore: unexpected error: {e}");
+                return Err(e.into());
+            }
         }
     };
 
@@ -78,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // pluggable (might need to provide ser/de implementations though) at no performance
     // cost (generic, not `dyn`). E.g., could be `<String, String>`.
     let raft: Engine<HashMap<u64, i64>> =
-        Engine::new(this_node.clone(), remote_nodes.clone(), persistent_state);
+        Engine::new(this_node.clone(), peers.clone(), persistent_state);
     raft.start(
         raft_incoming_rx,
         raft_outgoing_tx,
@@ -97,11 +93,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             move || {
                 for (node, msg) in raft_outgoing_rx {
-                    send(&MessageEnvelope {
+                    if let Err(e) = send(&MessageEnvelope {
                         source: this_node.clone(),
                         destination: node,
                         body: msg,
-                    });
+                    }) {
+                        eprintln!("error sending outgoing Raft message: {e}")
+                    };
                 }
             }
         })
@@ -115,17 +113,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             move || {
                 for (client, msg) in client_outgoing_rx {
-                    send(&MessageEnvelope {
+                    if let Err(e) = send(&MessageEnvelope {
                         source: this_node.clone(),
                         destination: client,
                         body: msg,
-                    });
+                    }) {
+                        eprintln!("error sending outgoing client message: {e}");
+                    };
                 }
             }
         })
         .expect("thread creation should succeed");
 
     // Handle incoming messages (Raft and KV clients).
+    let mut buf = String::with_capacity(128);
     let mut n = 0u64;
     loop {
         n += 1;

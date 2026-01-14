@@ -23,6 +23,7 @@ pub mod persistence;
 pub mod rpc;
 mod serde;
 mod state;
+pub mod supervisor;
 
 /// Identifier for nodes in the cluster.
 type NodeID = String;

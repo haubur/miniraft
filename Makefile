@@ -12,7 +12,8 @@ NEMESIS      ?= partition
 NEMESIS_INT  ?= 10
 TEST_COUNT   ?= 1
 
-# Java/Maelstrom (which is Clojure) tmp dir
+# Java/Maelstrom (which is Clojure) tmp dir. Maelstrom runs our binary inside this tmp
+# dir. Controlling its location is convenient.
 TMP_DIR      := .state
 
 .PHONY: all build run bench
@@ -37,6 +38,14 @@ run: build docker-compose
 		--nemesis-interval $(NEMESIS_INT) \
 		--nemesis $(NEMESIS) \
 		--test-count $(TEST_COUNT)
+
+# https://github.com/josephburnett/jd
+diff:
+	jd .state/node/n0 .state/node/n1 || true
+	@echo ""
+	jd .state/node/n0 .state/node/n2 || true
+	@echo ""
+	jd .state/node/n1 .state/node/n2 || true
 
 bench:
 	cargo +nightly bench
