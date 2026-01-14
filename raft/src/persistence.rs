@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::env::temp_dir;
 use std::error::Error;
 use std::fmt::{self, Debug, Display};
-use std::io::{self, Read, Write};
+use std::fs::{self, File};
+use std::io::{self, BufWriter, ErrorKind, Read, Seek, Write};
+use std::path::PathBuf;
 
 use json::Value as JSONValue;
 use json::error::Error as JSONError;
@@ -169,6 +172,119 @@ impl<Cmd: Deserialize> Persistent<Cmd> {
     }
 }
 
+/// A [`File`] with "Move on `Flush`" semantics (funky huh).
+#[derive(Debug)]
+pub struct FileMoF {
+    /// The target to manage.
+    ///
+    /// Note how we do not ever open a file handle to it: all writing is in the inner
+    /// type. "Writing" to the target is an atomic file rename.
+    target: PathBuf,
+    inner: (PathBuf, BufWriter<File>),
+}
+
+impl FileMoF {
+    /// Creates a new instance of a path to manage.
+    pub fn new(path: PathBuf) -> io::Result<Self> {
+        Ok(Self {
+            target: path,
+            inner: Self::new_backing()?,
+        })
+    }
+
+    /// Generates a new random file name -- a bit like a UUID.
+    fn generate_name() -> String {
+        let mut s = String::with_capacity(64);
+        s.push_str("raft-persistence-");
+        for _ in 0..32 {
+            let n = rand::rand() * 16.0;
+            #[allow(clippy::cast_possible_truncation)]
+            s.push(char::from_digit(n as u32, 16).expect("is within bounds"))
+        }
+        s
+    }
+
+    /// Creates a new random backing file, with a buffered, open handle to it. Ready to
+    /// accept new writes for a new atomic swap on flush.
+    ///
+    /// Grants tries before giving up in case of file name conflicts (highly
+    /// unlikely...).
+    fn new_backing() -> io::Result<(PathBuf, BufWriter<File>)> {
+        (0..3)
+            .into_iter()
+            .find_map(|_| {
+                let path = temp_dir().join(Self::generate_name());
+                let handle = File::create_new(&path).ok()?;
+                Some((path, BufWriter::new(handle)))
+            })
+            .inspect(|(path, _)| {
+                eprintln!(
+                    "file: generated new backing file at {}",
+                    path.to_string_lossy()
+                );
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidFilename,
+                    "after 3 attempts, unable to create temporary file",
+                )
+            })
+    }
+}
+
+impl Write for FileMoF {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.1.write(buf)
+    }
+
+    /// For this type, flushing to the `target` means renaming to it, which is atomic.
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.1.flush()?; // Flush out buffered writer
+        self.inner.1.get_ref().sync_all()?; // fsync
+
+        std::fs::rename(&self.inner.0, &self.target)?;
+
+        if let Some(parent) = self.inner.0.parent() {
+            let dir = File::open(parent)?;
+            dir.sync_all()?; // fsync rename
+        }
+
+        eprintln!(
+            "file: flushed out, moved {} -> {}",
+            self.inner.0.to_string_lossy(),
+            self.target.to_string_lossy()
+        );
+
+        Ok(())
+    }
+}
+
+impl Seek for FileMoF {
+    /// NB: not too useful. To be atomic, we do not allow arbitrary seeking.
+    fn seek(&mut self, _: io::SeekFrom) -> io::Result<u64> {
+        eprintln!("file: warning: any seeking causes rewinding");
+        self.rewind().map(|()| 0)
+    }
+
+    /// Rewinding resets the inner state, creating a fresh temporary copy to work
+    /// against for a new atomic operation later on.
+    fn rewind(&mut self) -> io::Result<()> {
+        // No use for previous file anymore.
+        fs::remove_file(&self.inner.0).or_else(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        })?;
+
+        // Create a new temporary file.
+        self.inner = Self::new_backing()?;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -235,6 +351,26 @@ mod tests {
                 String::from_utf8_lossy(&file)
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_mof() -> TestResult<()> {
+        let target = temp_dir().join("test_file_mof");
+        let mut f = FileMoF::new(target.clone())?;
+
+        f.write_all(b"some bytes")?;
+        f.flush()?;
+
+        f.rewind()?;
+
+        f.write_all(b"some more bytes")?;
+        f.flush()?;
+
+        f.rewind()?;
+
+        fs::remove_file(target)?;
 
         Ok(())
     }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
 use std::sync::mpsc;
 use std::{io, thread};
@@ -8,7 +9,7 @@ use raft::Engine;
 use raft::maelstrom::NodeMessageIDGenerator;
 use raft::maelstrom::infra::{read, read_and_handle_init, route_incoming, send};
 use raft::maelstrom::rpc::MessageEnvelope;
-use raft::persistence::Persistent;
+use raft::persistence::{FileMoF, Persistent};
 use raft::rpc::Message;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,32 +23,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // See if we have existing durable state from past runs. Start from scratch if we
     // don't. I/O errors outside of the file outright missing are fatal at this stage.
-    let (persistence_file, persistent_state) = {
+    let (persistence_path, persistent_state) = {
         let path = Path::new("./.state/node").join(&this_node);
         std::fs::create_dir_all(path.parent().expect("has parent"))?;
         match File::create_new(&path) {
-            Ok(f) => {
+            Ok(_) => {
                 eprintln!(
                     "persistence: new empty file at {}",
                     path.canonicalize()?.to_string_lossy()
                 );
-                (f, Default::default())
+                (path, Persistent::default())
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                let mut f = std::fs::OpenOptions::new()
+                let f = std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
                     .open(&path)?; // reverse TOCTOU?!
-                let p = Persistent::restore(&mut f)?;
+                let p_state = Persistent::restore(&mut BufReader::new(f))?;
                 eprintln!(
                     "persistence: restored from {}",
                     path.canonicalize()?.to_string_lossy()
                 );
-                (f, p)
+                (path, p_state)
             }
             Err(e) => return Err(e.into()),
         }
     };
+
+    let persistence_file = FileMoF::new(persistence_path)?;
 
     // Other Raft peers contacting this node (at any time)
     let (raft_incoming_tx, raft_incoming_rx) = mpsc::channel();
