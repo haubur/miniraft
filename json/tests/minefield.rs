@@ -31,7 +31,7 @@ fn test_json_minefield() -> Result<(), Box<dyn Error>> {
     let mut errors = Errors(vec![]);
 
     let mut corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    corpus.push("tests/corpus");
+    corpus.push("tests/corpus/minefield");
     eprintln!("using minefield corpus at {corpus:?}");
 
     let mut files = vec![];

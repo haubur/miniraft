@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["raft", "json", "base64", "rand"]
+members = ["raft", "json", "base64", "rand", "xtask"]
 
 [workspace.package]
 version = "0.1.0"

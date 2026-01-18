@@ -1,0 +1,19 @@
+{
+    "b": 1,
+    "foo": [
+        "baz"
+    ],
+    "identical_items": [
+        1,
+        2,
+        3
+    ],
+    "differing_items": [
+        1,
+        2,
+        0
+    ],
+    "nested": {
+        "b": 1
+    }
+}

@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+description = "Repo-internal tasks (cf. https://github.com/matklad/cargo-xtask)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+json = { workspace = true }
+
+[lints]
+workspace = true

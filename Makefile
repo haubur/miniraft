@@ -39,8 +39,15 @@ run: build docker-compose
 		--nemesis $(NEMESIS) \
 		--test-count $(TEST_COUNT)
 
-# https://github.com/josephburnett/jd
 diff:
+	cargo xtask jdiff .state/node/n0 .state/node/n1 || true
+	@echo ""
+	cargo xtask jdiff .state/node/n0 .state/node/n2 || true
+	@echo ""
+	cargo xtask jdiff .state/node/n1 .state/node/n2 || true
+
+# https://github.com/josephburnett/jd
+jdiff:
 	jd .state/node/n0 .state/node/n1 || true
 	@echo ""
 	jd .state/node/n0 .state/node/n2 || true

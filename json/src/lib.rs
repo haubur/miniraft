@@ -5,6 +5,7 @@ use std::iter::Peekable;
 use std::num::{NonZero, ParseFloatError, ParseIntError};
 use std::str;
 
+pub mod diff;
 pub mod error;
 pub mod serde;
 
