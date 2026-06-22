@@ -11,3 +11,7 @@ rand.workspace = true
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "main-http"
+path = "src/main-http.rs"

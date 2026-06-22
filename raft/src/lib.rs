@@ -17,6 +17,7 @@ use crate::persistence::{PersistenceError, Persistent};
 use crate::rpc::{ClientMessage, MessageID};
 use crate::state::{Dismiss, State, StateMachine};
 
+pub mod http;
 pub mod maelstrom;
 mod metrics;
 pub mod persistence;

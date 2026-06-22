@@ -13,9 +13,11 @@ use raft::rpc::Message;
 use raft::{Engine, supervisor};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The main process never passes the gate.
     let (this_node, peers) = supervisor::gate(std::env::vars_os())?;
     eprintln!("process: passed gate: this node: {this_node}, peers: {peers:?}");
 
+    // Only child processes go here:
     // See if we have existing durable state from past runs. Start from scratch if we
     // don't. I/O errors outside of the file outright missing are fatal at this stage.
     let (persistence_path, persistent_state) = {
