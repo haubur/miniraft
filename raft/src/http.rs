@@ -6,7 +6,13 @@ use std::io::prelude::*;
 use std::net::{Shutdown, TcpStream};
 use std::str::FromStr;
 
-// HTTP/1.1 message format accroding to https://httpwg.org/specs/rfc9112.html
+// HTTP/1.1 message format accroding to https://www.rfc-editor.org/info/rfc9112/#section-2
+// Messages expected as:
+// HTTP-message   = start-line CRLF
+//                  *( field-line CRLF )
+//                  CRLF
+//                  [ message-body ]
+//
 // enum HttpMessage {
 //     Request(HttpRequest),
 //     Response(HttpResponse),
@@ -17,7 +23,7 @@ struct Request {
     method: Method,
     uri: String,
     headers: HashMap<String, String>,
-    body: String,
+    body: Option<String>,
 }
 
 impl Request {
@@ -29,9 +35,7 @@ impl Request {
         reader
             .read_line(&mut request)
             .expect("stream should have readable line");
-        eprintln!("{:?}", request);
         let request_line: Vec<&str> = request.split_whitespace().collect();
-        eprintln!("{:?}", request_line);
         let incoming_method =
             Method::from_str(request_line[0]).expect("should have valid http method");
         // NOTE: maybe introduce type safe URI
@@ -44,8 +48,6 @@ impl Request {
             let incoming_size = reader
                 .read_line(&mut header_element)
                 .expect("should be valid string");
-
-            eprintln!("{:?}", header_element);
 
             if header_element == "\r\n" || incoming_size == 0 {
                 break; // end of header
@@ -61,20 +63,48 @@ impl Request {
 
         eprintln!("{:?}", incoming_headers);
 
-        // reading body
-        let mut incoming_body = String::new();
-        loop {
-            let mut body_line = String::new();
-            let incoming_size = reader
-                .read_line(&mut body_line)
-                .expect("should be valid string");
+        let incoming_body: Option<String> = if incoming_headers.contains_key("Content-Length") {
+            let cap: usize = incoming_headers
+                .get("Content-Length")
+                .expect("should have Content-Length")
+                .parse()
+                .expect("Content-Length should be parsable");
+            let mut buf_body = String::with_capacity(cap);
+            loop {
+                let mut body_line = String::new();
+                let incoming_size = reader
+                    .read_line(&mut body_line)
+                    .expect("should be valid string");
+                eprintln!("{:?}", body_line);
 
-            if incoming_size == 0 {
-                break;
+                if incoming_size == 0 {
+                    break;
+                }
+                buf_body.push_str(&body_line);
             }
+            Some(buf_body)
+        } else {
+            None
+        };
+        // Expect a body only, if Content-Length is available.
+        // let mut incoming_body = String::new();
+        // if let Some(_) = incoming_headers.get("Content-Length") {
+        //     loop {
+        //         let mut body_line = String::new();
+        //         let incoming_size = reader
+        //             .read_line(&mut body_line)
+        //             .expect("should be valid string");
+        //         eprintln!("{:?}", body_line);
 
-            incoming_body.push_str(&body_line);
-        }
+        //         if incoming_size == 0 {
+        //             eprintln!(
+        //                 "Content-Length in headers, but incoming body size == 0. No body read."
+        //             );
+        //             break;
+        //         }
+        //         incoming_body.push_str(&body_line);
+        //     }
+        // }
 
         // parsing Request
         Request {
@@ -152,9 +182,10 @@ mod tests {
 
     #[test]
     fn get_request_from_stream() {
-        // use cursor for testing from_stream
+        // Use Cursor to simulate TcpStream
         let test_request: String =
-            "GET /key/key-id HTTP/1.1\r\nContent-Length: 123\r\nsome simple test body data".into();
+            "GET /key/key-id HTTP/1.1\r\nContent-Length: 26\r\n\r\nsome simple test body data"
+                .into();
         let mut buf = Cursor::new(test_request.into_bytes());
         let test_request = Request::from_stream(&mut buf);
 
@@ -162,8 +193,21 @@ mod tests {
         assert_eq!(test_request.uri, "/key/key-id");
         assert_eq!(
             test_request.headers.get("Content-Length"),
-            Some(&String::from("123"))
+            Some(&String::from("26"))
         );
         assert_eq!(test_request.headers.len(), 1);
+        assert_eq!(
+            test_request.body.clone().unwrap(),
+            "some simple test body data"
+        );
+        assert_eq!(
+            test_request.body.unwrap().len(),
+            test_request
+                .headers
+                .get("Content-Length")
+                .expect("should have content length")
+                .parse::<usize>()
+                .expect("Content-Length should be parsable into usize")
+        )
     }
 }
