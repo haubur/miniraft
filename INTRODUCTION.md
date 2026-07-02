@@ -95,6 +95,7 @@ Since it's an interesting excercise and allows broader experimentation with mini
 - [Diego Ongaro's dissertation](https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf)
 - [async-raft](https://github.com/async-raft/async-raft)
 - [TLA+ specification](https://github.com/ongardie/raft.tla/blob/master/raft.tla)
+- [Jon Gejengset's Students Guide to Raft](https://thesquareplanet.com/blog/students-guide-to-raft/)
 
 # Notes
 - serialization/ parsing (base64/ JSON)
