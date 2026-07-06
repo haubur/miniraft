@@ -1,8 +1,11 @@
+use crate::rpc::ClientMessage;
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Cursor;
 use std::io::prelude::*;
+#[cfg(test)]
+use std::net::TcpListener;
 use std::net::{Shutdown, TcpStream};
 use std::str::FromStr;
 
@@ -18,8 +21,15 @@ use std::str::FromStr;
 //     Response(HttpResponse),
 // }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum IncomingMessageType {
+    HTTPRequest,
+    HTTPResponse,
+    PeerMessage,
+}
+
 #[derive(Debug)]
-struct Request {
+pub struct Request {
     method: Method,
     uri: String,
     headers: HashMap<String, String>,
@@ -27,7 +37,7 @@ struct Request {
 }
 
 impl Request {
-    pub fn from_stream<S: Read + Write>(stream: &mut S) -> Self {
+    pub fn from_stream<S: Read + Write>(stream: S) -> Self {
         let mut reader = BufReader::new(stream);
 
         // reading request line
@@ -86,25 +96,6 @@ impl Request {
         } else {
             None
         };
-        // Expect a body only, if Content-Length is available.
-        // let mut incoming_body = String::new();
-        // if let Some(_) = incoming_headers.get("Content-Length") {
-        //     loop {
-        //         let mut body_line = String::new();
-        //         let incoming_size = reader
-        //             .read_line(&mut body_line)
-        //             .expect("should be valid string");
-        //         eprintln!("{:?}", body_line);
-
-        //         if incoming_size == 0 {
-        //             eprintln!(
-        //                 "Content-Length in headers, but incoming body size == 0. No body read."
-        //             );
-        //             break;
-        //         }
-        //         incoming_body.push_str(&body_line);
-        //     }
-        // }
 
         // parsing Request
         Request {
@@ -112,6 +103,32 @@ impl Request {
             uri: incoming_uri,
             headers: incoming_headers,
             body: incoming_body,
+        }
+    }
+
+    pub fn get_key(&self) -> &str {
+        let (_, key) = self
+            .uri
+            .split_once("/key/")
+            .expect("should have /key/ in uri");
+        key
+    }
+}
+
+impl From<Request> for ClientMessage<String, String> {
+    fn from(item: Request) -> Self {
+        match item.method {
+            Method::Get => ClientMessage::ReadRequest {
+                key: item.get_key().into(),
+                id: 0,
+            },
+            Method::Post => ClientMessage::WriteRequest {
+                key: item.get_key().into(),
+                value: item.body.expect("should have body"),
+                id: 0,
+            },
+            Method::Put => unreachable!("no put available"),
+            Method::Delete => unreachable!("no delete available"),
         }
     }
 }
@@ -137,19 +154,44 @@ impl FromStr for Method {
     }
 }
 
-pub fn handle_connection(mut stream: TcpStream) {
-    let mut reader = BufReader::new(&mut stream);
-    let mut request = String::new();
-    reader.read_line(&mut request).unwrap();
-    eprintln!("Received request: {:?}", request);
+/// Peek a TcpStream to check if its a ClientMessage.
+///
+/// Peeks the TcpStream and checks for any HTTP verb.
+/// If we find any, we have a HTTP ClientMessage on the wire,
+/// not a RaftMessage nor an outgoing HTTP ClientMessage.
+pub fn sniff_message_type(s: &mut TcpStream) -> Result<IncomingMessageType, std::io::Error> {
+    let mut buf = [0u8; 128];
+    s.peek(&mut buf).expect("stream should be peekable");
+    if buf.starts_with(b"GET") || buf.starts_with(b"POST") || buf.starts_with(b"PUT") {
+        return Ok(IncomingMessageType::HTTPRequest);
+    } else if buf.starts_with(b"HTTP") {
+        return Ok(IncomingMessageType::HTTPResponse);
+    } else {
+        return Ok(IncomingMessageType::PeerMessage);
+    }
+}
 
-    // let mut req_iter = request.split_whitespace();
-
-    // match req_iter.next() {
-    //     Some("GET") => eprintln!("handling get request"),
-    //     Some("PUT") => eprintln!("handling put request"),
-    //     _ => eprintln!("nothing"),
-    // }
+/// Handles incoming client and peer messages.
+///
+/// Both client and raft messages land on the TcpStream.
+/// Client messages are HTTP. Raft messages have some tbd wire format.
+/// For incoming client messages, deserialize into ClientMessage move msg on thread handling incoming client messages.
+/// For incoming Raft messages, deserialize into RaftMessage and move msg on thread handling incoming Raft messages.
+pub fn handle_connection(mut stream: TcpStream) -> Result<(), std::io::Error> {
+    // Need to sniff to check if incoming is ClientMessage or RaftMessage
+    match sniff_message_type(&mut stream)? {
+        IncomingMessageType::HTTPRequest => {
+            let request = Request::from_stream(&stream);
+            let message: ClientMessage<String, String> = request.into();
+            eprintln!("{:?}", message);
+        }
+        IncomingMessageType::HTTPResponse => {
+            unreachable!(); // TODO: tcp connection correlation
+        }
+        IncomingMessageType::PeerMessage => {
+            unreachable!(); // TODO: forward peer messages over channels
+        }
+    }
 
     stream
         // Connection-Header required to enforce Client to close the connection: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Connection_management_in_HTTP_1.x#short-lived_connections
@@ -157,6 +199,7 @@ pub fn handle_connection(mut stream: TcpStream) {
         .write_all(b"HTTP/1.1 200\r\n Connection: Close\r\n\r\n")
         .expect("writing data failed");
     stream.shutdown(Shutdown::Both).expect("shut down failed");
+    Ok(())
 }
 
 // Analog to raft/src/maelstrom/infra.rs. Read message from TcpStream instead of stdin
@@ -174,10 +217,41 @@ pub fn send() {}
 mod tests {
     use super::*;
 
+    /// Helper to to simulate incoming messages over Tcp.
+    fn server_stream_with(data: &[u8]) -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("should bind");
+        let addr = listener.local_addr().expect("should have local addr");
+
+        let mut client = TcpStream::connect(addr).expect("should connect to addr");
+        client.write_all(data).expect("should write test data");
+        client.flush().expect("should flush test data");
+
+        let (server, _) = listener.accept().expect("should accept connection");
+        server
+    }
+
     #[test]
     fn get_method_from_string() {
         let string_method: &str = "GET";
         assert_eq!(Method::from_str(&string_method).unwrap(), Method::Get);
+    }
+
+    #[test]
+    fn is_incoming_http_request() {
+        let mut stream = server_stream_with(b"GET /key/key-id HTTP/1.1");
+        assert_eq!(
+            sniff_message_type(&mut stream).unwrap(),
+            IncomingMessageType::HTTPRequest
+        );
+    }
+
+    #[test]
+    fn is_not_incoming_http_request() {
+        let mut stream = server_stream_with(b"HTTP/1.1 403 Forbidden");
+        assert_eq!(
+            sniff_message_type(&mut stream).unwrap(),
+            IncomingMessageType::HTTPResponse
+        );
     }
 
     #[test]

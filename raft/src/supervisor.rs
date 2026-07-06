@@ -22,7 +22,7 @@ const TIME_BOMB_INTERVAL: Duration = Duration::from_millis(1_000);
 /// The child passes this same gate and runs as a normal process. On crash, it is
 /// revived by the supervisor.
 pub fn gate(mut env: env::VarsOs) -> Result<(String, Vec<String>), io::Error> {
-    // Child-branch: If process is child, trigger time-bomb.
+    // Child-branch: If process is child, trigger time-bomb and return.
     if env.any(|(name, value)| name == CHILD_MARKER_ENV_VAR && value == CHILD_MARKER_ENV_VAR_VALUE)
     {
         eprintln!(
@@ -64,7 +64,7 @@ pub fn gate(mut env: env::VarsOs) -> Result<(String, Vec<String>), io::Error> {
         return Ok((this_node, peers));
     }
 
-    // Supervisor-branch: If process is supervisor spwan child and 'wait' until it dies, then trigger relaunch
+    // Supervisor-branch: If process is supervisor spawn child and 'wait' until it dies, then trigger relaunch. Never returns.
     eprintln!(
         "process: supervisor: pid {}, parent {}",
         process::id(),
