@@ -93,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // **entire application**. They cascade down everywhere, and are thus easily
         // pluggable (might need to provide ser/de implementations though) at no performance
         // cost (generic, not `dyn`). E.g., could be `<String, String>`.
-        let raft: Engine<HashMap<u64, i64>> =
+        let raft: Engine<HashMap<String, String>> =
             Engine::new(this_node.clone(), peers.clone(), persistent_state);
         raft.start(
             raft_incoming_rx,
@@ -151,11 +151,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // End copying setup from raft/src/main.rs
         // ---
 
+        let correlation_map: HashMap<NodeID, TcpStream> = HashMap::new();
+        type CorrMap = Arc<Mutex<correlation_map>>;
+
+        // Handling incoming messages if different to main.rs
+        // Instead of reading from a common/ shared std i/o each node listens on a port for TCP.
+        // Via TCP we receive both client messages and peer messages.
+        // In handle_connection an incoming TcpStream is sniffed and dispatched to handle either of the
+        // `IncomingMessageType`s.
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         for stream in listener.incoming() {
             // Avoid requests being blocked. Each stream gets its own thread.
             // Note: We do not require a handle to wait for the thread, since main never finishes (and therefore cannot drop while thread hasnt finished)
-            thread::spawn(move || handle_connection(stream.expect("should have a stream")));
+            thread::spawn(move || {
+                handle_connection(
+                    this_node.clone(),
+                    stream.expect("should have a stream"),
+                    client_incoming_tx.clone(),
+                    raft_incoming_tx.clone(),
+                )
+            });
         }
     }
 

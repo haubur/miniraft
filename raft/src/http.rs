@@ -1,13 +1,20 @@
-use crate::rpc::ClientMessage;
+use crate::NodeID;
+use crate::maelstrom::NodeMessageIDGenerator;
+use crate::maelstrom::rpc::MessageEnvelope;
+use crate::rpc::{ClientMessage, RaftMessage};
+use json::serde::Serialize;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::io::BufRead;
 use std::io::BufReader;
-use std::io::Cursor;
 use std::io::prelude::*;
 #[cfg(test)]
 use std::net::TcpListener;
 use std::net::{Shutdown, TcpStream};
+use std::num::NonZeroU16;
 use std::str::FromStr;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 // HTTP/1.1 message format accroding to https://www.rfc-editor.org/info/rfc9112/#section-2
 // Messages expected as:
@@ -20,6 +27,8 @@ use std::str::FromStr;
 //     Request(HttpRequest),
 //     Response(HttpResponse),
 // }
+
+const ALLOWED_STATUS_CODES: [u16; 3] = [200, 201, 400];
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum IncomingMessageType {
@@ -34,6 +43,84 @@ pub struct Request {
     uri: String,
     headers: HashMap<String, String>,
     body: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct StatusCode(NonZeroU16);
+
+impl StatusCode {
+    pub fn from_u16(code: u16) -> Result<Self, std::io::Error> {
+        if ALLOWED_STATUS_CODES.contains(&code) {
+            if let Some(num) = NonZeroU16::new(code) {
+                return Ok(StatusCode(num));
+            }
+        }
+        panic!("provided code not in allowed list")
+    }
+}
+
+#[derive(Debug)]
+pub struct Response {
+    status: StatusCode,
+    headers: HashMap<String, String>,
+    body: Option<String>,
+}
+
+impl<K, V> From<MessageEnvelope<ClientMessage<K, V>>> for Response
+where
+    // Keys never surface in a response, so `K` is unconstrained beyond the
+    // `Debug` needed for the panic below. A response value only needs to render
+    // into the HTTP body, hence `ToString`.
+    K: Debug,
+    V: ToString + Debug,
+{
+    fn from(envelope: MessageEnvelope<ClientMessage<K, V>>) -> Self {
+        let (code, body) = match envelope.body {
+            ClientMessage::ReadResponse { value, .. } => (200, Some(value.to_string())),
+            ClientMessage::WriteResponse { .. } => (201, None),
+            ClientMessage::CASResponse { .. } => (200, None),
+            ClientMessage::ErrorResponse { text, .. } => (400, Some(text)),
+            msg => unreachable!("requests should never be parsed as a response: got {msg:?}"), // TODO: This is bad design. It's only unreachable if called with correct routing in sniff_message_type.
+        };
+
+        let mut headers = HashMap::new();
+        if let Some(body) = &body {
+            headers.insert("Content-Length".into(), body.len().to_string());
+        }
+        headers.insert("Connection".into(), "close".into());
+
+        Response {
+            status: StatusCode::from_u16(code).expect("mapped codes are in the allow list"),
+            headers,
+            body,
+        }
+    }
+}
+
+impl Response {
+    /// Serialize into the HTTP/1.1 wire format, ready to write onto a TcpStream.
+    pub fn to_wire(&self) -> Vec<u8> {
+        let reason = match self.status.0.get() {
+            200 => "OK",
+            201 => "Created",
+            400 => "Bad Request",
+            _ => "",
+        };
+
+        let mut wire = format!("HTTP/1.1 {} {}\r\n", self.status.0.get(), reason);
+        for (key, value) in &self.headers {
+            wire.push_str(key);
+            wire.push_str(": ");
+            wire.push_str(value);
+            wire.push_str("\r\n");
+        }
+        wire.push_str("\r\n"); // signals end of header
+        if let Some(body) = &self.body {
+            wire.push_str(body);
+        }
+
+        wire.into_bytes()
+    }
 }
 
 impl Request {
@@ -117,15 +204,19 @@ impl Request {
 
 impl From<Request> for ClientMessage<String, String> {
     fn from(item: Request) -> Self {
+        let id = NodeMessageIDGenerator
+            .next()
+            .expect("should generate message id")
+            .get();
         match item.method {
             Method::Get => ClientMessage::ReadRequest {
                 key: item.get_key().into(),
-                id: 0,
+                id,
             },
             Method::Post => ClientMessage::WriteRequest {
                 key: item.get_key().into(),
                 value: item.body.expect("should have body"),
-                id: 0,
+                id,
             },
             Method::Put => unreachable!("no put available"),
             Method::Delete => unreachable!("no delete available"),
@@ -154,17 +245,25 @@ impl FromStr for Method {
     }
 }
 
-/// Peek a TcpStream to check if its a ClientMessage.
+/// Peek a TcpStream to sniff the message type.
 ///
-/// Peeks the TcpStream and checks for any HTTP verb.
-/// If we find any, we have a HTTP ClientMessage on the wire,
-/// not a RaftMessage nor an outgoing HTTP ClientMessage.
+/// Decide if incoming message is HTTP request, serialized ClientMessage (response type) or RaftMessage.
+///
+/// Assume HTTP request, if message starts with a HTTP verb (here GET, POST, PUT only).
+/// Messages that are supposed to be client responses are of type [`ClientMessage`]. They contain either
+/// `read_ok`, `write_ok`, `cas_ok` or `error` (compare https://github.com/haubur/miniraft/blob/f25e4091550600b912dcdb49877d48aa8d31f09e/raft/src/rpc.rs#L348).
+/// Third, all [`RaftMessage`]s are [`IncomingMessageType::PeerMessage`]s to be forwarded to peer nodes.
 pub fn sniff_message_type(s: &mut TcpStream) -> Result<IncomingMessageType, std::io::Error> {
-    let mut buf = [0u8; 128];
-    s.peek(&mut buf).expect("stream should be peekable");
-    if buf.starts_with(b"GET") || buf.starts_with(b"POST") || buf.starts_with(b"PUT") {
+    let mut buf = [0u8; 1024];
+    let n = s.peek(&mut buf).expect("stream should be peekable");
+    let head = String::from_utf8_lossy(&buf[..n]);
+    if head.starts_with("GET") || head.starts_with("POST") || head.starts_with("PUT") {
         return Ok(IncomingMessageType::HTTPRequest);
-    } else if buf.starts_with(b"HTTP") {
+    } else if head.contains("read_ok")
+        || head.contains("write_ok")
+        || head.contains("cas_ok")
+        || head.contains("error")
+    {
         return Ok(IncomingMessageType::HTTPResponse);
     } else {
         return Ok(IncomingMessageType::PeerMessage);
@@ -177,41 +276,65 @@ pub fn sniff_message_type(s: &mut TcpStream) -> Result<IncomingMessageType, std:
 /// Client messages are HTTP. Raft messages have some tbd wire format.
 /// For incoming client messages, deserialize into ClientMessage move msg on thread handling incoming client messages.
 /// For incoming Raft messages, deserialize into RaftMessage and move msg on thread handling incoming Raft messages.
-pub fn handle_connection(mut stream: TcpStream) -> Result<(), std::io::Error> {
-    // Need to sniff to check if incoming is ClientMessage or RaftMessage
+pub fn handle_connection<K, V, Cmd>(
+    id: String,
+    mut stream: TcpStream,
+    response_queue: &mut Arc<Mutex<HashMap<NodeID, TcpStream>>>,
+    client_incoming_tx: Sender<(NodeID, ClientMessage<String, String>)>,
+    raft_incoming_tx: Sender<(NodeID, RaftMessage<Cmd>)>,
+) -> Result<(), std::io::Error> {
     match sniff_message_type(&mut stream)? {
         IncomingMessageType::HTTPRequest => {
+            // Sniffed a HTTP request. Request will be parsed into Request type and send
+            // over the proper channel to the thread handling incoming client messages.
             let request = Request::from_stream(&stream);
             let message: ClientMessage<String, String> = request.into();
-            eprintln!("{:?}", message);
+            eprintln!("{:?}", &message);
+
+            // add request to repsonse_queue to match later occuring response with the correct stream
+            let qid = format!("node-{}-{}", id, message.id());
+            response_queue
+                .lock()
+                .expect("should be able to acquire lock")
+                .insert(qid, stream);
+
+            // send request to Raft engine thread that handles incoming requests
+            client_incoming_tx
+                .send((id, message))
+                .expect("message should be sendable");
+            Ok(())
         }
         IncomingMessageType::HTTPResponse => {
-            unreachable!(); // TODO: tcp connection correlation
+            // Sniffed a serialized ClientMessage. Message will be parsed into Response and sent to the socket
+            // which is waiting for this exact response.
+            Ok(())
         }
         IncomingMessageType::PeerMessage => {
             unreachable!(); // TODO: forward peer messages over channels
         }
     }
-
-    stream
-        // Connection-Header required to enforce Client to close the connection: https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Connection_management_in_HTTP_1.x#short-lived_connections
-        // HTTPResponse should be a type later with to_bytes or something
-        .write_all(b"HTTP/1.1 200\r\n Connection: Close\r\n\r\n")
-        .expect("writing data failed");
-    stream.shutdown(Shutdown::Both).expect("shut down failed");
-    Ok(())
 }
 
-// Analog to raft/src/maelstrom/infra.rs. Read message from TcpStream instead of stdin
-//
-// Returns a generic (message) type. Either RaftMessage or ClientMessage.
-// pub fn read<M: Deserialize + Debug>(s: TcpStream) -> Result<M, std::io::Error> {
-//     // Read stream into a Request type and serialize into RaftMessage/ClientMessage
-// }
+pub fn send_tcp<B: Serialize>(msg: &MessageEnvelope<B>) -> std::io::Result<()> {
+    // TODO: copied but explain why
+    assert_ne!(msg.source, msg.destination, "routing bug: sending to self");
 
-// Analog to raft/src/maelstrom/infra.rs
-// Send message to TcpStream instead of stdout
-pub fn send() {}
+    let payload = msg
+        .serialize()
+        .expect("all internal types should be serializable")
+        .to_string();
+
+    // Node names == TCP ports on localhost.
+    let port: u16 = msg.destination.parse().expect("should be parsable");
+    eprintln!("sending msg to {}: {payload}", msg.destination);
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.write_all(payload.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
