@@ -2,6 +2,7 @@ use crate::NodeID;
 use crate::maelstrom::NodeMessageIDGenerator;
 use crate::maelstrom::rpc::MessageEnvelope;
 use crate::rpc::{ClientMessage, RaftMessage};
+use json::Value as JSONValue;
 use json::serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -307,6 +308,41 @@ pub fn handle_connection<K, V, Cmd>(
         IncomingMessageType::HTTPResponse => {
             // Sniffed a serialized ClientMessage. Message will be parsed into Response and sent to the socket
             // which is waiting for this exact response.
+
+            // read message bytes to JSONValue and parse into MessageEnvelope
+            let recv_json: JSONValue = json::Parser::new(&stream).parse().expect("should be json");
+            let envelope: MessageEnvelope<ClientMessage<String, String>> =
+                json::serde::Deserialize::deserialize(recv_json).expect("should be serializable");
+
+            // The response's `in_reply_to` is the request id the waiting client
+            // stream was queued under on the way in, so it reconstructs the qid.
+            let in_reply_to = match &envelope.body {
+                ClientMessage::ReadResponse { in_reply_to, .. }
+                | ClientMessage::WriteResponse { in_reply_to, .. }
+                | ClientMessage::CASResponse { in_reply_to, .. }
+                | ClientMessage::ErrorResponse { in_reply_to, .. } => *in_reply_to,
+                msg => unreachable!("expected a client response, got {msg:?}"),
+            };
+            let qid = format!("node-{}-{}", id, in_reply_to);
+
+            // build Response from MessageEnvelope and get as bytes to sent to client
+            let response: Response = envelope.into();
+            let bytes_to_sent = response.to_wire();
+
+            // Pick the stream that is waiting for this response and answer it over
+            // HTTP. Removing it also drops our handle once written, closing the
+            // connection (the response carries `Connection: close`).
+            let waiting = response_queue
+                .lock()
+                .expect("should be able to acquire lock")
+                .remove(&qid);
+            match waiting {
+                Some(mut client_stream) => {
+                    client_stream.write_all(&bytes_to_sent)?;
+                    client_stream.flush()?;
+                }
+                None => eprintln!("no client awaiting response {qid}, dropping"),
+            }
             Ok(())
         }
         IncomingMessageType::PeerMessage => {
@@ -316,7 +352,7 @@ pub fn handle_connection<K, V, Cmd>(
 }
 
 pub fn send_tcp<B: Serialize>(msg: &MessageEnvelope<B>) -> std::io::Result<()> {
-    // TODO: copied but explain why
+    // I don't know, how did he find out?
     assert_ne!(msg.source, msg.destination, "routing bug: sending to self");
 
     let payload = msg
@@ -328,10 +364,11 @@ pub fn send_tcp<B: Serialize>(msg: &MessageEnvelope<B>) -> std::io::Result<()> {
     let port: u16 = msg.destination.parse().expect("should be parsable");
     eprintln!("sending msg to {}: {payload}", msg.destination);
 
+    // Send message body to destination via TCP
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     stream.write_all(payload.as_bytes())?;
-    stream.write_all(b"\n")?;
     stream.flush()?;
+    stream.shutdown(Shutdown::Write)?;
 
     Ok(())
 }

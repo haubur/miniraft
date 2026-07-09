@@ -1,14 +1,17 @@
+use crate::NodeID;
 /// A program that simulates Raft consensus using tcp/http.
 ///
 ///
 use std::collections::HashMap;
 use std::fs::{self};
 use std::io::{Cursor, ErrorKind};
+use std::net::TcpStream;
 use std::path::Path;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-use raft::http::handle_connection;
+use raft::http::*;
 use raft::maelstrom::NodeMessageIDGenerator;
 use raft::maelstrom::infra::{read, route_incoming, send};
 use raft::maelstrom::rpc::MessageEnvelope;
@@ -113,8 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 move || {
                     for (node, msg) in raft_outgoing_rx {
-                        if let Err(e) = send(&MessageEnvelope {
-                            // TODO: replace with send_tcp: Sends a MessageEnvelope over TCP to some peer.
+                        if let Err(e) = send_tcp(&MessageEnvelope {
                             source: this_node.clone(),
                             destination: node,
                             body: msg,
@@ -134,8 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 move || {
                     for (client, msg) in client_outgoing_rx {
-                        if let Err(e) = send(&MessageEnvelope {
-                            // TODO: replace with send_http: Sends a HTTP response in answer to a previous HTTP request.
+                        if let Err(e) = send_tcp(&MessageEnvelope {
                             source: this_node.clone(),
                             destination: client,
                             body: msg,
@@ -151,8 +152,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // End copying setup from raft/src/main.rs
         // ---
 
-        let correlation_map: HashMap<NodeID, TcpStream> = HashMap::new();
-        type CorrMap = Arc<Mutex<correlation_map>>;
+        let correlation_map: Arc<Mutex<HashMap<NodeID, TcpStream>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // Handling incoming messages if different to main.rs
         // Instead of reading from a common/ shared std i/o each node listens on a port for TCP.
@@ -167,6 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 handle_connection(
                     this_node.clone(),
                     stream.expect("should have a stream"),
+                    &mut correlation_map,
                     client_incoming_tx.clone(),
                     raft_incoming_tx.clone(),
                 )
