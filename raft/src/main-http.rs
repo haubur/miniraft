@@ -1,30 +1,27 @@
-use crate::NodeID;
+use raft::Engine;
+use raft::http::*;
+use raft::maelstrom::NodeMessageIDGenerator;
+use raft::maelstrom::rpc::MessageEnvelope;
+use raft::persistence::{FileMoF, Persistent};
 /// A program that simulates Raft consensus using tcp/http.
 ///
 ///
 use std::collections::HashMap;
+use std::env;
 use std::fs::{self};
 use std::io::{Cursor, ErrorKind};
+use std::net::TcpListener;
 use std::net::TcpStream;
 use std::path::Path;
+use std::process::Command;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-
-use raft::http::*;
-use raft::maelstrom::NodeMessageIDGenerator;
-use raft::maelstrom::infra::{read, route_incoming, send};
-use raft::maelstrom::rpc::MessageEnvelope;
-use raft::persistence::{FileMoF, Persistent};
-use raft::rpc::Message;
-use raft::{Engine, supervisor};
-use std::env;
-use std::net::TcpListener;
-use std::process::Command;
+use std::vec::Vec;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Child branch: A process that runs Raft.
-    if let Ok(me) = env::var("IAM") {
+    if env::var("IAM").is_ok() {
         // NOTE: TCP port of node is also node name
         let this_node = env::var("IAM").expect("should have port");
         let port: u16 = this_node.parse().expect("port should be parsable to u16");
@@ -83,14 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // This node contacting cluster clients (at any time)
         let (client_outgoing_tx, client_outgoing_rx) = mpsc::channel();
 
-        let metrics_addr = (
-            "127.0.0.1",
-            11_000
-                + this_node
-                    .strip_prefix(|c: char| !c.is_numeric())
-                    .ok_or("need node name with numeric component for stable metrics port")?
-                    .parse::<u16>()?,
-        );
+        let metrics_addr = ("127.0.0.1", 11_000 + this_node.parse::<u16>()?);
 
         // Note, the concrete key-value types are set below, **a single time** for the
         // **entire application**. They cascade down everywhere, and are thus easily
@@ -152,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // End copying setup from raft/src/main.rs
         // ---
 
-        let correlation_map: Arc<Mutex<HashMap<NodeID, TcpStream>>> =
+        let correlation_map: Arc<Mutex<HashMap<String, TcpStream>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         // Handling incoming messages if different to main.rs
@@ -162,15 +152,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `IncomingMessageType`s.
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         for stream in listener.incoming() {
-            // Avoid requests being blocked. Each stream gets its own thread.
-            // Note: We do not require a handle to wait for the thread, since main never finishes (and therefore cannot drop while thread hasnt finished)
+            let stream = stream.expect("should have a stream");
+            let this_node = this_node.clone();
+            let mut correlation_map = Arc::clone(&correlation_map);
+            let client_incoming_tx = client_incoming_tx.clone();
+            let raft_incoming_tx = raft_incoming_tx.clone();
             thread::spawn(move || {
                 handle_connection(
-                    this_node.clone(),
-                    stream.expect("should have a stream"),
+                    this_node,
+                    stream,
                     &mut correlation_map,
-                    client_incoming_tx.clone(),
-                    raft_incoming_tx.clone(),
+                    client_incoming_tx,
+                    raft_incoming_tx,
                 )
             });
         }
@@ -181,15 +174,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nodes: Vec<&str> = env_nodes.split(",").collect();
 
     let exe = env::current_exe()?;
+    let mut childs = Vec::with_capacity(nodes.len());
     for node in &nodes {
         let mut peers = nodes.clone();
         peers.retain(|&x| x != *node);
         println!("{:?}", peers);
-        let proc = Command::new(&exe)
+        let child = Command::new(&exe)
             .env("IAM", node)
             .env("PEERS", peers.join(","))
             .spawn()?;
+        childs.push(child);
     }
-    // Supervisor process must not terminate, else child processes are reparented and not killed with Ctrl+C
-    loop {}
+
+    for mut c in childs {
+        if let Err(e) = c.wait() {
+            eprintln!("error waiting for child {e}")
+        };
+    }
+    Ok(())
 }

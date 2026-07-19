@@ -421,7 +421,7 @@ where
                     state
                         .lock()
                         .expect("no poison")
-                        .replicate_log()
+                        .replicate_log() // returns RaftMessage::AppendEntries
                         .into_iter()
                         .try_for_each(|msg| raft_tx.send(msg))
                         .expect("raft receiver should never hang up");
@@ -462,7 +462,7 @@ where
                         // fine (= same ID -> same operation). Our response might differ
                         // but linearizability for the client is retained.
                         let original_id = req.id();
-                        let forward_id = response_id; // reuse but rename
+                        let forward_id = response_id; // reuse but rename from l.388
                         eprintln!(
                             "proxy: to known leader {leader}: {}({}) -> {}",
                             client,

@@ -1,11 +1,13 @@
 use crate::NodeID;
 use crate::maelstrom::NodeMessageIDGenerator;
+use crate::maelstrom::infra::route_incoming;
 use crate::maelstrom::rpc::MessageEnvelope;
-use crate::rpc::{ClientMessage, RaftMessage};
+use crate::rpc::{ClientMessage, Message, RaftMessage};
 use json::Value as JSONValue;
-use json::serde::Serialize;
+use json::serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::hash::Hash;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::prelude::*;
@@ -34,8 +36,8 @@ const ALLOWED_STATUS_CODES: [u16; 3] = [200, 201, 400];
 #[derive(Debug, Eq, PartialEq)]
 pub enum IncomingMessageType {
     HTTPRequest,
-    HTTPResponse,
-    PeerMessage,
+    JSON,
+    Unidentified,
 }
 
 #[derive(Debug)]
@@ -67,7 +69,7 @@ pub struct Response {
     body: Option<String>,
 }
 
-impl<K, V> From<MessageEnvelope<ClientMessage<K, V>>> for Response
+impl<K, V> From<ClientMessage<K, V>> for Response
 where
     // Keys never surface in a response, so `K` is unconstrained beyond the
     // `Debug` needed for the panic below. A response value only needs to render
@@ -75,8 +77,8 @@ where
     K: Debug,
     V: ToString + Debug,
 {
-    fn from(envelope: MessageEnvelope<ClientMessage<K, V>>) -> Self {
-        let (code, body) = match envelope.body {
+    fn from(message: ClientMessage<K, V>) -> Self {
+        let (code, body) = match message {
             ClientMessage::ReadResponse { value, .. } => (200, Some(value.to_string())),
             ClientMessage::WriteResponse { .. } => (201, None),
             ClientMessage::CASResponse { .. } => (200, None),
@@ -167,19 +169,13 @@ impl Request {
                 .expect("should have Content-Length")
                 .parse()
                 .expect("Content-Length should be parsable");
-            let mut buf_body = String::with_capacity(cap);
-            loop {
-                let mut body_line = String::new();
-                let incoming_size = reader
-                    .read_line(&mut body_line)
-                    .expect("should be valid string");
-                eprintln!("{:?}", body_line);
 
-                if incoming_size == 0 {
-                    break;
-                }
-                buf_body.push_str(&body_line);
-            }
+            let mut buf_body = String::with_capacity(cap);
+            reader
+                .by_ref()
+                .take(cap as u64)
+                .read_to_string(&mut buf_body)
+                .expect("should read Content-Length bytes of body");
             Some(buf_body)
         } else {
             None
@@ -248,26 +244,23 @@ impl FromStr for Method {
 
 /// Peek a TcpStream to sniff the message type.
 ///
-/// Decide if incoming message is HTTP request, serialized ClientMessage (response type) or RaftMessage.
+/// Since now everything arrives via TCP, peek the stream to derive what kind of message is incoming.
+/// - client request (HTTP client)
+/// - forwarded client message (MessageEnvelope)
+/// - client response (MessageEnvelope)
+/// - raft messsage (MesssageEnvelope)
 ///
-/// Assume HTTP request, if message starts with a HTTP verb (here GET, POST, PUT only).
-/// Messages that are supposed to be client responses are of type [`ClientMessage`]. They contain either
-/// `read_ok`, `write_ok`, `cas_ok` or `error` (compare https://github.com/haubur/miniraft/blob/f25e4091550600b912dcdb49877d48aa8d31f09e/raft/src/rpc.rs#L348).
-/// Third, all [`RaftMessage`]s are [`IncomingMessageType::PeerMessage`]s to be forwarded to peer nodes.
-pub fn sniff_message_type(s: &mut TcpStream) -> Result<IncomingMessageType, std::io::Error> {
-    let mut buf = [0u8; 1024];
-    let n = s.peek(&mut buf).expect("stream should be peekable");
-    let head = String::from_utf8_lossy(&buf[..n]);
-    if head.starts_with("GET") || head.starts_with("POST") || head.starts_with("PUT") {
-        return Ok(IncomingMessageType::HTTPRequest);
-    } else if head.contains("read_ok")
-        || head.contains("write_ok")
-        || head.contains("cas_ok")
-        || head.contains("error")
-    {
-        return Ok(IncomingMessageType::HTTPResponse);
+/// Returns an IncomingMessageType or Error if message can not be resolved.
+pub fn sniff_message_type(s: &mut TcpStream) -> IncomingMessageType {
+    let mut buf = [0u8; 7]; // largest HTTP method
+    s.peek(&mut buf);
+
+    if buf.starts_with(b"GET") || buf.starts_with(b"POST") || buf.starts_with(b"PUT") {
+        IncomingMessageType::HTTPRequest
+    } else if buf.starts_with(b"{") {
+        IncomingMessageType::JSON
     } else {
-        return Ok(IncomingMessageType::PeerMessage);
+        IncomingMessageType::Unidentified
     }
 }
 
@@ -281,15 +274,25 @@ pub fn handle_connection<K, V, Cmd>(
     id: String,
     mut stream: TcpStream,
     response_queue: &mut Arc<Mutex<HashMap<NodeID, TcpStream>>>,
-    client_incoming_tx: Sender<(NodeID, ClientMessage<String, String>)>,
+    client_incoming_tx: Sender<(NodeID, ClientMessage<K, V>)>,
     raft_incoming_tx: Sender<(NodeID, RaftMessage<Cmd>)>,
-) -> Result<(), std::io::Error> {
-    match sniff_message_type(&mut stream)? {
+) -> Result<(), std::io::Error>
+where
+    // Union of the bounds each branch requires: `route_incoming` (Serialize +
+    // Hash/Eq/PartialEq + Debug + Send + 'static), JSON parsing (Deserialize),
+    // the HTTP branch (`Request: Into<ClientMessage>`) and the `Response`
+    // conversion (`V: ToString`).
+    K: Serialize + Deserialize + Hash + Eq + Debug + Send + 'static,
+    V: Serialize + Deserialize + PartialEq + ToString + Debug + Send + 'static,
+    Cmd: Serialize + Deserialize + 'static,
+    Request: Into<ClientMessage<K, V>>,
+{
+    match sniff_message_type(&mut stream) {
         IncomingMessageType::HTTPRequest => {
             // Sniffed a HTTP request. Request will be parsed into Request type and send
             // over the proper channel to the thread handling incoming client messages.
             let request = Request::from_stream(&stream);
-            let message: ClientMessage<String, String> = request.into();
+            let message: ClientMessage<K, V> = request.into();
             eprintln!("{:?}", &message);
 
             // add request to repsonse_queue to match later occuring response with the correct stream
@@ -305,33 +308,59 @@ pub fn handle_connection<K, V, Cmd>(
                 .expect("message should be sendable");
             Ok(())
         }
-        IncomingMessageType::HTTPResponse => {
-            // Sniffed a serialized ClientMessage. Message will be parsed into Response and sent to the socket
-            // which is waiting for this exact response.
-
-            // read message bytes to JSONValue and parse into MessageEnvelope
+        IncomingMessageType::JSON => {
+            // Sniffed JSON. Try to parse into [`MessageEnvelope`] and dispatch.
             let recv_json: JSONValue = json::Parser::new(&stream).parse().expect("should be json");
-            let envelope: MessageEnvelope<ClientMessage<String, String>> =
-                json::serde::Deserialize::deserialize(recv_json).expect("should be serializable");
+            let envelope: MessageEnvelope<Message<K, V, Cmd>> =
+                json::serde::Deserialize::deserialize(recv_json).expect("should be parseable");
 
-            // The response's `in_reply_to` is the request id the waiting client
-            // stream was queued under on the way in, so it reconstructs the qid.
-            let in_reply_to = match &envelope.body {
+            // Check if received message is a client response that needs to resurface.
+            let is_client_response = matches!(
+                &envelope.body,
+                Message::Client(
+                    ClientMessage::ReadResponse { .. }
+                        | ClientMessage::WriteResponse { .. }
+                        | ClientMessage::CASResponse { .. }
+                        | ClientMessage::ErrorResponse { .. }
+                )
+            );
+
+            // If message is not intended to resurface, send to proper channel to be handled by one of the Raft threads.
+            if !is_client_response {
+                // Client requests -> client channel, raft messages -> raft channel.
+                route_incoming(envelope, raft_incoming_tx, client_incoming_tx);
+                return Ok(());
+            }
+
+            // Each node keeps client TCP connections open to catch and map reponses to send back.
+            // Responses can occur asynchronously on a different node (e.g. the leader).
+            // Forward responses to the node which holds the client connection.
+            if envelope.destination != id {
+                eprintln!("relaying client response to {}", envelope.destination);
+                return send_tcp(&envelope);
+            }
+
+            // Strip envelope from message. Destination has been reached, source is irrelevant for response.
+            let Message::Client(message) = envelope.body else {
+                unreachable!("guarded by is_client_response")
+            };
+
+            // Build qid to match TCPStream waiting for a response.
+            let in_reply_to = match &message {
                 ClientMessage::ReadResponse { in_reply_to, .. }
                 | ClientMessage::WriteResponse { in_reply_to, .. }
                 | ClientMessage::CASResponse { in_reply_to, .. }
                 | ClientMessage::ErrorResponse { in_reply_to, .. } => *in_reply_to,
-                msg => unreachable!("expected a client response, got {msg:?}"),
+                msg => unreachable!("guarded by is_client_response, got {msg:?}"),
             };
             let qid = format!("node-{}-{}", id, in_reply_to);
 
-            // build Response from MessageEnvelope and get as bytes to sent to client
-            let response: Response = envelope.into();
+            // Build the HTTP Response from the client message and get the bytes to send back.
+            let response: Response = message.into();
             let bytes_to_sent = response.to_wire();
 
-            // Pick the stream that is waiting for this response and answer it over
-            // HTTP. Removing it also drops our handle once written, closing the
-            // connection (the response carries `Connection: close`).
+            // Pick and remove the waiting TCPStream from the queue.
+            // Send the HTTP reponse and close the connection.
             let waiting = response_queue
                 .lock()
                 .expect("should be able to acquire lock")
@@ -345,16 +374,14 @@ pub fn handle_connection<K, V, Cmd>(
             }
             Ok(())
         }
-        IncomingMessageType::PeerMessage => {
-            unreachable!(); // TODO: forward peer messages over channels
+        IncomingMessageType::Unidentified => {
+            // Sniffed an unrelated message.
+            Ok(())
         }
     }
 }
 
 pub fn send_tcp<B: Serialize>(msg: &MessageEnvelope<B>) -> std::io::Result<()> {
-    // I don't know, how did he find out?
-    assert_ne!(msg.source, msg.destination, "routing bug: sending to self");
-
     let payload = msg
         .serialize()
         .expect("all internal types should be serializable")
@@ -364,7 +391,7 @@ pub fn send_tcp<B: Serialize>(msg: &MessageEnvelope<B>) -> std::io::Result<()> {
     let port: u16 = msg.destination.parse().expect("should be parsable");
     eprintln!("sending msg to {}: {payload}", msg.destination);
 
-    // Send message body to destination via TCP
+    // Send MessagEnvelope to destination via TCP
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     stream.write_all(payload.as_bytes())?;
     stream.flush()?;
