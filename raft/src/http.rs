@@ -10,6 +10,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::io::BufRead;
 use std::io::BufReader;
+use std::io::ErrorKind;
 use std::io::prelude::*;
 #[cfg(test)]
 use std::net::TcpListener;
@@ -31,8 +32,6 @@ use std::sync::{Arc, Mutex};
 //     Response(HttpResponse),
 // }
 
-const ALLOWED_STATUS_CODES: [u16; 3] = [200, 201, 400];
-
 #[derive(Debug, Eq, PartialEq)]
 pub enum IncomingMessageType {
     HTTPRequest,
@@ -52,13 +51,12 @@ pub struct Request {
 pub struct StatusCode(NonZeroU16);
 
 impl StatusCode {
-    pub fn from_u16(code: u16) -> Result<Self, std::io::Error> {
-        if ALLOWED_STATUS_CODES.contains(&code) {
-            if let Some(num) = NonZeroU16::new(code) {
-                return Ok(StatusCode(num));
-            }
+    pub fn from_u16(code: u16) -> Self {
+        if let Some(num) = NonZeroU16::new(code) {
+            return StatusCode(num);
+        } else {
+            unreachable!("should always have valid non-zero u16")
         }
-        panic!("provided code not in allowed list")
     }
 }
 
@@ -71,9 +69,6 @@ pub struct Response {
 
 impl<K, V> From<ClientMessage<K, V>> for Response
 where
-    // Keys never surface in a response, so `K` is unconstrained beyond the
-    // `Debug` needed for the panic below. A response value only needs to render
-    // into the HTTP body, hence `ToString`.
     K: Debug,
     V: ToString + Debug,
 {
@@ -83,7 +78,12 @@ where
             ClientMessage::WriteResponse { .. } => (201, None),
             ClientMessage::CASResponse { .. } => (200, None),
             ClientMessage::ErrorResponse { text, .. } => (400, Some(text)),
-            msg => unreachable!("requests should never be parsed as a response: got {msg:?}"), // TODO: This is bad design. It's only unreachable if called with correct routing in sniff_message_type.
+            msg => (
+                500,
+                Some(format!(
+                    "Internal Server Error (tried to cast other than ClientMessage response: {msg:?})"
+                )),
+            ),
         };
 
         let mut headers = HashMap::new();
@@ -93,7 +93,7 @@ where
         headers.insert("Connection".into(), "close".into());
 
         Response {
-            status: StatusCode::from_u16(code).expect("mapped codes are in the allow list"),
+            status: StatusCode::from_u16(code),
             headers,
             body,
         }
@@ -107,6 +107,7 @@ impl Response {
             200 => "OK",
             201 => "Created",
             400 => "Bad Request",
+            500 => "Internal Server Error",
             _ => "",
         };
 
@@ -127,17 +128,16 @@ impl Response {
 }
 
 impl Request {
-    pub fn from_stream<S: Read + Write>(stream: S) -> Self {
+    pub fn from_stream<S: Read + Write>(stream: S) -> Result<Self, std::io::Error> {
         let mut reader = BufReader::new(stream);
 
         // reading request line
         let mut request = String::new();
-        reader
-            .read_line(&mut request)
-            .expect("stream should have readable line");
+        reader.read_line(&mut request)?;
         let request_line: Vec<&str> = request.split_whitespace().collect();
-        let incoming_method =
-            Method::from_str(request_line[0]).expect("should have valid http method");
+        let incoming_method = Method::from_str(request_line[0])?;
+
+        // reading URI
         // NOTE: maybe introduce type safe URI
         let incoming_uri: String = request_line[1].into();
 
@@ -145,9 +145,7 @@ impl Request {
         let mut incoming_headers: HashMap<String, String> = HashMap::new();
         loop {
             let mut header_element = String::new();
-            let incoming_size = reader
-                .read_line(&mut header_element)
-                .expect("should be valid string");
+            let incoming_size = reader.read_line(&mut header_element)?;
 
             if header_element == "\r\n" || incoming_size == 0 {
                 break; // end of header
@@ -161,33 +159,32 @@ impl Request {
             incoming_headers.insert(key.into(), value.into());
         }
 
-        eprintln!("{:?}", incoming_headers);
-
+        // reading body if any, requires Content-Length header
         let incoming_body: Option<String> = if incoming_headers.contains_key("Content-Length") {
             let cap: usize = incoming_headers
                 .get("Content-Length")
-                .expect("should have Content-Length")
+                .ok_or("could not get Content-Length from header")
+                .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?
                 .parse()
-                .expect("Content-Length should be parsable");
+                .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
 
             let mut buf_body = String::with_capacity(cap);
             reader
                 .by_ref()
                 .take(cap as u64)
-                .read_to_string(&mut buf_body)
-                .expect("should read Content-Length bytes of body");
+                .read_to_string(&mut buf_body)?;
             Some(buf_body)
         } else {
             None
         };
 
         // parsing Request
-        Request {
+        Ok(Request {
             method: incoming_method,
             uri: incoming_uri,
             headers: incoming_headers,
             body: incoming_body,
-        }
+        })
     }
 
     pub fn get_key(&self) -> &str {
@@ -199,24 +196,30 @@ impl Request {
     }
 }
 
-impl From<Request> for ClientMessage<String, String> {
-    fn from(item: Request) -> Self {
+impl TryFrom<Request> for ClientMessage<String, String> {
+    type Error = std::io::Error;
+    fn try_from(item: Request) -> Result<Self, Self::Error> {
         let id = NodeMessageIDGenerator
             .next()
             .expect("should generate message id")
             .get();
         match item.method {
-            Method::Get => ClientMessage::ReadRequest {
+            Method::Get => Ok(ClientMessage::ReadRequest {
                 key: item.get_key().into(),
                 id,
-            },
-            Method::Post => ClientMessage::WriteRequest {
+            }),
+            Method::Post => Ok(ClientMessage::WriteRequest {
                 key: item.get_key().into(),
-                value: item.body.expect("should have body"),
+                value: item.body.ok_or(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "no body, but required for post",
+                ))?,
                 id,
-            },
-            Method::Put => unreachable!("no put available"),
-            Method::Delete => unreachable!("no delete available"),
+            }),
+            msg @ (Method::Put | Method::Delete) => Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("{msg:?}"),
+            )),
         }
     }
 }
@@ -251,16 +254,16 @@ impl FromStr for Method {
 /// - raft messsage (MesssageEnvelope)
 ///
 /// Returns an IncomingMessageType or Error if message can not be resolved.
-pub fn sniff_message_type(s: &mut TcpStream) -> IncomingMessageType {
+pub fn sniff_message_type(s: &mut TcpStream) -> Result<IncomingMessageType, std::io::Error> {
     let mut buf = [0u8; 7]; // largest HTTP method
-    s.peek(&mut buf);
+    s.peek(&mut buf)?;
 
     if buf.starts_with(b"GET") || buf.starts_with(b"POST") || buf.starts_with(b"PUT") {
-        IncomingMessageType::HTTPRequest
+        Ok(IncomingMessageType::HTTPRequest)
     } else if buf.starts_with(b"{") {
-        IncomingMessageType::JSON
+        Ok(IncomingMessageType::JSON)
     } else {
-        IncomingMessageType::Unidentified
+        Ok(IncomingMessageType::Unidentified)
     }
 }
 
@@ -278,21 +281,17 @@ pub fn handle_connection<K, V, Cmd>(
     raft_incoming_tx: Sender<(NodeID, RaftMessage<Cmd>)>,
 ) -> Result<(), std::io::Error>
 where
-    // Union of the bounds each branch requires: `route_incoming` (Serialize +
-    // Hash/Eq/PartialEq + Debug + Send + 'static), JSON parsing (Deserialize),
-    // the HTTP branch (`Request: Into<ClientMessage>`) and the `Response`
-    // conversion (`V: ToString`).
     K: Serialize + Deserialize + Hash + Eq + Debug + Send + 'static,
     V: Serialize + Deserialize + PartialEq + ToString + Debug + Send + 'static,
     Cmd: Serialize + Deserialize + 'static,
-    Request: Into<ClientMessage<K, V>>,
+    Request: TryInto<ClientMessage<K, V>, Error = std::io::Error>,
 {
-    match sniff_message_type(&mut stream) {
+    match sniff_message_type(&mut stream)? {
         IncomingMessageType::HTTPRequest => {
             // Sniffed a HTTP request. Request will be parsed into Request type and send
             // over the proper channel to the thread handling incoming client messages.
-            let request = Request::from_stream(&stream);
-            let message: ClientMessage<K, V> = request.into();
+            let request = Request::from_stream(&stream)?;
+            let message: ClientMessage<K, V> = request.try_into()?;
             eprintln!("{:?}", &message);
 
             // add request to repsonse_queue to match later occuring response with the correct stream
@@ -310,9 +309,12 @@ where
         }
         IncomingMessageType::JSON => {
             // Sniffed JSON. Try to parse into [`MessageEnvelope`] and dispatch.
-            let recv_json: JSONValue = json::Parser::new(&stream).parse().expect("should be json");
+            let recv_json: JSONValue = json::Parser::new(&stream)
+                .parse()
+                .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
             let envelope: MessageEnvelope<Message<K, V, Cmd>> =
-                json::serde::Deserialize::deserialize(recv_json).expect("should be parseable");
+                json::serde::Deserialize::deserialize(recv_json)
+                    .map_err(|e| std::io::Error::new(ErrorKind::Interrupted, e))?;
 
             // Check if received message is a client response that needs to resurface.
             let is_client_response = matches!(
@@ -351,7 +353,7 @@ where
                 | ClientMessage::WriteResponse { in_reply_to, .. }
                 | ClientMessage::CASResponse { in_reply_to, .. }
                 | ClientMessage::ErrorResponse { in_reply_to, .. } => *in_reply_to,
-                msg => unreachable!("guarded by is_client_response, got {msg:?}"),
+                msg => unreachable!("only reponses survive as is_client_response, got {msg:?}"),
             };
             let qid = format!("node-{}-{}", id, in_reply_to);
 
@@ -363,7 +365,7 @@ where
             // Send the HTTP reponse and close the connection.
             let waiting = response_queue
                 .lock()
-                .expect("should be able to acquire lock")
+                .map_err(|e| std::io::Error::new(ErrorKind::Interrupted, e.to_string()))?
                 .remove(&qid);
             match waiting {
                 Some(mut client_stream) => {
@@ -375,13 +377,13 @@ where
             Ok(())
         }
         IncomingMessageType::Unidentified => {
-            // Sniffed an unrelated message.
+            eprintln!("Raft server sniffed an unrelated message on TCP. Message is not processed.");
             Ok(())
         }
     }
 }
 
-pub fn send_tcp<B: Serialize>(msg: &MessageEnvelope<B>) -> std::io::Result<()> {
+pub fn send_tcp<B: Serialize>(msg: &MessageEnvelope<B>) -> Result<(), std::io::Error> {
     let payload = msg
         .serialize()
         .expect("all internal types should be serializable")
