@@ -208,18 +208,33 @@ impl TryFrom<Request> for ClientMessage<String, String> {
                 key: item.get_key().into(),
                 id,
             }),
-            Method::Post => Ok(ClientMessage::WriteRequest {
-                key: item.get_key().into(),
-                value: item.body.ok_or(std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    "no body, but required for post",
-                ))?,
-                id,
-            }),
-            msg @ (Method::Put | Method::Delete) => Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                format!("{msg:?}"),
-            )),
+            // PUT receives WriteRequests and CASRequests with If-Match condition
+            Method::Put => match item.headers.contains_key("If-Match") {
+                true => Ok(ClientMessage::CASRequest {
+                    key: item.get_key().into(),
+                    from: item
+                        .headers
+                        .get("If-Match")
+                        .ok_or(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "found If-Match but failed to get it",
+                        ))?
+                        .to_string(),
+                    to: item.body.ok_or(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "no body, but required for post",
+                    ))?,
+                    id,
+                }),
+                false => Ok(ClientMessage::WriteRequest {
+                    key: item.get_key().into(),
+                    value: item.body.ok_or(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "no body, but required for post",
+                    ))?,
+                    id,
+                }),
+            },
         }
     }
 }
@@ -227,9 +242,8 @@ impl TryFrom<Request> for ClientMessage<String, String> {
 #[derive(Debug, PartialEq)]
 enum Method {
     Get,
-    Post,
+    // A key-value store is idempotent as is PUT: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Methods/PUT
     Put,
-    Delete,
 }
 
 impl FromStr for Method {
@@ -237,10 +251,8 @@ impl FromStr for Method {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "GET" => Ok(Method::Get),
-            "POST" => Ok(Method::Post),
             "PUT" => Ok(Method::Put),
-            "DELETE" => Ok(Method::Delete),
-            _ => panic!("Invalid method {}", s),
+            _ => Err(std::io::Error::new(ErrorKind::InvalidData, s)),
         }
     }
 }
