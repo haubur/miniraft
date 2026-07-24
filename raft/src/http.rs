@@ -369,22 +369,31 @@ where
             };
             let qid = format!("node-{}-{}", id, in_reply_to);
 
-            // Build the HTTP Response from the client message and get the bytes to send back.
-            let response: Response = message.into();
-            let bytes_to_sent = response.to_wire();
-
             // Pick and remove the waiting TCPStream from the queue.
-            // Send the HTTP reponse and close the connection.
             let waiting = response_queue
                 .lock()
                 .map_err(|e| std::io::Error::new(ErrorKind::Interrupted, e.to_string()))?
                 .remove(&qid);
+
             match waiting {
                 Some(mut client_stream) => {
-                    client_stream.write_all(&bytes_to_sent)?;
+                    // Build the HTTP response from the client message and send it, then close the connection.
+                    let response: Response = message.into();
+                    client_stream.write_all(&response.to_wire())?;
                     client_stream.flush()?;
                 }
-                None => eprintln!("no client awaiting response {qid}, dropping"),
+                None => {
+                    // Response did not hit proxies map in handle_client_messages.
+                    // Message needs another trip through the engine, in order to swap the message_id
+                    // back to the original one held in the proxies map.
+                    // This is an extra round trip that should be avoided, but kept here to mirror the maelstrom variant behaviour.
+                    eprintln!(
+                        "no stream for {qid}: routing back to engine to swap back to original id"
+                    );
+                    client_incoming_tx
+                        .send((id, message))
+                        .expect("client listener should never hang up");
+                }
             }
             Ok(())
         }
