@@ -349,10 +349,11 @@ where
             // Each node keeps client TCP connections open to catch and map reponses to send back.
             // Responses can occur asynchronously on a different node (e.g. the leader).
             // Forward responses to the node which holds the client connection.
-            if envelope.destination != id {
-                eprintln!("relaying client response to {}", envelope.destination);
-                return send_tcp(&envelope);
-            }
+            // TODO: in send_tcp we route to destination so this cannot happen
+            // if envelope.destination != id {
+            //     eprintln!("relaying client response to {}", envelope.destination);
+            //     return send_tcp(&envelope);
+            // }
 
             // Strip envelope from message. Destination has been reached, source is irrelevant for response.
             let Message::Client(message) = envelope.body else {
@@ -360,20 +361,45 @@ where
             };
 
             // Build qid to match TCPStream waiting for a response.
-            let in_reply_to = match &message {
-                ClientMessage::ReadResponse { in_reply_to, .. }
-                | ClientMessage::WriteResponse { in_reply_to, .. }
-                | ClientMessage::CASResponse { in_reply_to, .. }
-                | ClientMessage::ErrorResponse { in_reply_to, .. } => *in_reply_to,
+            //
+            // NOTE: I do not like it but it works for now.
+            // A response message to this node could have taken two different paths.
+            // (1) This node is a follower. The the request is forwarded to the leader.
+            // In that case the original message_id assigned by this node upon parsing the Request into a ClientRequest will be replaced
+            // by a forward_id (also from this node) and both the forward_id and original_id are inserted into a proxy map along with the node_id.
+            // When a response returns from the leader, the message.id is reverted back to the original_id (comp. loop-back below).
+            // Mapping the response to the request then happens on msg_id.
+            // (2) This node is a leader. There is no need to forward the message. Instead the message receives a fresh response_id from the same node.
+            // The original message_id is set as in_reply_to when building the Command in lib.rs l.724.
+            // Since we do not know here if we are a leader or not we check both cases, poping either from the response_queue and respond.
+            let (msg_id, reply_id) = match &message {
+                ClientMessage::ReadResponse {
+                    id, in_reply_to, ..
+                }
+                | ClientMessage::WriteResponse {
+                    id, in_reply_to, ..
+                }
+                | ClientMessage::CASResponse {
+                    id, in_reply_to, ..
+                }
+                | ClientMessage::ErrorResponse {
+                    id, in_reply_to, ..
+                } => (*id, *in_reply_to),
                 msg => unreachable!("only reponses survive as is_client_response, got {msg:?}"),
             };
-            let qid = format!("node-{}-{}", id, in_reply_to);
 
-            // Pick and remove the waiting TCPStream from the queue.
-            let waiting = response_queue
-                .lock()
-                .map_err(|e| std::io::Error::new(ErrorKind::Interrupted, e.to_string()))?
-                .remove(&qid);
+            let qid_if_follower = format!("node-{}-{}", id, msg_id);
+            let qid_if_leader = format!("node-{}-{}", id, reply_id);
+
+            // Pick and remove the waiting TCPStream from the queue, matching either qid.
+            let waiting = {
+                let mut queue = response_queue
+                    .lock()
+                    .map_err(|e| std::io::Error::new(ErrorKind::Interrupted, e.to_string()))?;
+                queue
+                    .remove(&qid_if_follower)
+                    .or_else(|| queue.remove(&qid_if_leader))
+            };
 
             match waiting {
                 Some(mut client_stream) => {
@@ -383,15 +409,13 @@ where
                     client_stream.flush()?;
                 }
                 None => {
-                    // Response did not hit proxies map in handle_client_messages.
+                    // Response did not hit the branch to reset message_id via proxy map in incoming_client_rpcs_loop.
                     // Message needs another trip through the engine, in order to swap the message_id
                     // back to the original one held in the proxies map.
                     // This is an extra round trip that should be avoided, but kept here to mirror the maelstrom variant behaviour.
-                    eprintln!(
-                        "no stream for {qid}: routing back to engine to swap back to original id"
-                    );
+                    eprintln!("no stream for {qid_if_follower} or {qid_if_leader}");
                     client_incoming_tx
-                        .send((id, message))
+                        .send((id, message)) // id == envelope.destination
                         .expect("client listener should never hang up");
                 }
             }
