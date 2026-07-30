@@ -4,18 +4,18 @@ version = 4
 
 [[package]]
 name = "base64"
-version = "0.1.1"
+version = "0.2.0"
 
 [[package]]
 name = "json"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "base64",
 ]
 
 [[package]]
 name = "raft"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "json",
  "rand",
@@ -23,11 +23,11 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.1.1"
+version = "0.2.0"
 
 [[package]]
 name = "xtask"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "json",
 ]

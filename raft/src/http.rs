@@ -12,8 +12,6 @@ use std::io::BufRead;
 use std::io::BufReader;
 use std::io::ErrorKind;
 use std::io::prelude::*;
-#[cfg(test)]
-use std::net::TcpListener;
 use std::net::{Shutdown, TcpStream};
 use std::num::NonZeroU16;
 use std::str::FromStr;
@@ -433,4 +431,188 @@ pub fn send_tcp<B: Serialize>(msg: &MessageEnvelope<B>) -> Result<(), std::io::E
     stream.shutdown(Shutdown::Write)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::net::TcpListener;
+
+    // Request.new() helper
+    fn request(method: Method, uri: &str, headers: &[(&str, &str)], body: Option<&str>) -> Request {
+        Request {
+            method,
+            uri: uri.into(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: body.map(Into::into),
+        }
+    }
+
+    // helper to send some data over tcp
+    fn server_stream_with(data: &[u8]) -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("should bind");
+        let addr = listener.local_addr().expect("should have local addr");
+
+        let mut client = TcpStream::connect(addr).expect("should connect");
+        client.write_all(data).expect("should write");
+        client.flush().expect("should flush");
+
+        let (server, _) = listener.accept().expect("should accept");
+        server
+    }
+
+    #[test]
+    fn method_from_str() {
+        assert_eq!(Method::from_str("GET").unwrap(), Method::Get);
+        assert_eq!(Method::from_str("PUT").unwrap(), Method::Put);
+        assert!(Method::from_str("DELETE").is_err());
+    }
+
+    #[test]
+    fn from_stream_parses_request_line_headers_and_body() {
+        let raw = "PUT /key/foo HTTP/1.1\r\nContent-Length: 3\r\nIf-Match: 1\r\n\r\nbar";
+        let req = Request::from_stream(Cursor::new(raw.as_bytes().to_vec())).unwrap();
+
+        assert_eq!(req.method, Method::Put);
+        assert_eq!(req.uri, "/key/foo");
+        assert_eq!(req.headers.get("Content-Length"), Some(&"3".to_string()));
+        assert_eq!(req.headers.get("If-Match"), Some(&"1".to_string()));
+        assert_eq!(req.body.as_deref(), Some("bar"));
+    }
+
+    #[test]
+    fn from_stream_without_content_length_has_no_body() {
+        let req =
+            Request::from_stream(Cursor::new(b"GET /key/foo HTTP/1.1\r\n\r\n".to_vec())).unwrap();
+        assert_eq!(req.method, Method::Get);
+        assert_eq!(req.body, None);
+    }
+
+    #[test]
+    fn get_key_accepts_single_anchored_segment() {
+        let req = request(Method::Get, "/key/foo", &[], None);
+        assert_eq!(req.get_key().unwrap(), "foo");
+    }
+
+    #[test]
+    fn get_key_rejects_unanchored_or_missing_prefix() {
+        assert!(
+            request(Method::Get, "/other/key/foo", &[], None)
+                .get_key()
+                .is_err()
+        );
+        assert!(request(Method::Get, "/foo", &[], None).get_key().is_err());
+    }
+
+    #[test]
+    fn get_key_rejects_empty_or_nested_key() {
+        assert!(request(Method::Get, "/key/", &[], None).get_key().is_err());
+        assert!(
+            request(Method::Get, "/key/a/b", &[], None)
+                .get_key()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sniff_classifies_http_json_and_unidentified() {
+        let mut http = server_stream_with(b"GET /key/foo HTTP/1.1\r\n\r\n");
+        assert_eq!(
+            sniff_message_type(&mut http).unwrap(),
+            IncomingMessageType::HTTPRequest
+        );
+
+        let mut json = server_stream_with(b"{\"type\":\"append_entries\"}");
+        assert_eq!(
+            sniff_message_type(&mut json).unwrap(),
+            IncomingMessageType::JSON
+        );
+
+        let mut other = server_stream_with(b"HTTP/1.1 403 Forbidden");
+        assert_eq!(
+            sniff_message_type(&mut other).unwrap(),
+            IncomingMessageType::Unidentified
+        );
+    }
+
+    #[test]
+    fn get_request_becomes_read_request() {
+        let msg: ClientMessage<String, String> = request(Method::Get, "/key/foo", &[], None)
+            .try_into()
+            .unwrap();
+        assert!(matches!(msg, ClientMessage::ReadRequest { key, .. } if key == "foo"));
+    }
+
+    #[test]
+    fn put_without_if_match_becomes_write_request() {
+        let msg: ClientMessage<String, String> = request(Method::Put, "/key/foo", &[], Some("bar"))
+            .try_into()
+            .unwrap();
+        assert!(
+            matches!(msg, ClientMessage::WriteRequest { key, value, .. } if key == "foo" && value == "bar")
+        );
+    }
+
+    #[test]
+    fn put_with_if_match_becomes_cas_request() {
+        let msg: ClientMessage<String, String> =
+            request(Method::Put, "/key/foo", &[("If-Match", "1")], Some("bar"))
+                .try_into()
+                .unwrap();
+        assert!(
+            matches!(msg, ClientMessage::CASRequest { key, from, to, .. } if key == "foo" && from == "1" && to == "bar")
+        );
+    }
+
+    #[test]
+    fn put_without_body_is_rejected() {
+        let res: Result<ClientMessage<String, String>, _> =
+            request(Method::Put, "/key/foo", &[], None).try_into();
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn read_response_serializes_to_200_with_body() {
+        let msg: ClientMessage<String, String> = ClientMessage::ReadResponse {
+            in_reply_to: 1,
+            value: "bar".into(),
+            id: 2,
+        };
+        let wire = String::from_utf8(Response::from(msg).to_wire()).unwrap();
+
+        assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(wire.contains("Content-Length: 3\r\n"));
+        assert!(wire.ends_with("\r\n\r\nbar"));
+    }
+
+    #[test]
+    fn write_response_serializes_to_201_without_body() {
+        let msg: ClientMessage<String, String> = ClientMessage::WriteResponse {
+            in_reply_to: 1,
+            id: 2,
+        };
+        let wire = String::from_utf8(Response::from(msg).to_wire()).unwrap();
+
+        assert!(wire.starts_with("HTTP/1.1 201 Created\r\n"));
+        assert!(!wire.contains("Content-Length"));
+        assert!(wire.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn error_response_serializes_to_400_with_text() {
+        let msg: ClientMessage<String, String> = ClientMessage::ErrorResponse {
+            in_reply_to: 1,
+            id: 2,
+            code: 22,
+            text: "computer says no".into(),
+        };
+        let wire = String::from_utf8(Response::from(msg).to_wire()).unwrap();
+
+        assert!(wire.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(wire.ends_with("\r\n\r\ncomputer says no"));
+    }
 }
