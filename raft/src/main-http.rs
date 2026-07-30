@@ -1,11 +1,8 @@
 use raft::Engine;
-use raft::http::*;
+use raft::http::{handle_connection, send_tcp};
 use raft::maelstrom::NodeMessageIDGenerator;
 use raft::maelstrom::rpc::MessageEnvelope;
 use raft::persistence::{FileMoF, Persistent};
-/// A program that simulates Raft consensus using tcp/http.
-///
-///
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self};
@@ -22,7 +19,7 @@ use std::vec::Vec;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Child branch: A process that runs Raft.
     if env::var("IAM").is_ok() {
-        // NOTE: TCP port of node is also node name
+        // Tcp port of this node == node name
         let this_node = env::var("IAM").expect("should have port");
         let port: u16 = this_node.parse().expect("port should be parsable to u16");
         let peers: Vec<String> = env::var("PEERS")
@@ -142,14 +139,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // End copying setup from raft/src/main.rs
         // ---
 
+        // Http client requests landing on this nodes TcpStream wait for responses, that
+        // can occur on any other process.
+        // Do not block on wait, but cache waiting TcpStream and answer it, once the
+        // reponse lands on a fresh connection.
         let correlation_map: Arc<Mutex<HashMap<String, TcpStream>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        // Handling incoming messages if different to main.rs
-        // Instead of reading from a common/ shared std i/o each node listens on a port for TCP.
-        // Via TCP we receive both client messages and peer messages.
-        // In handle_connection an incoming TcpStream is sniffed and dispatched to handle either of the
-        // `IncomingMessageType`s.
+        // Handling incoming messages is different to main.rs which uses maelstrom.
+        // Instead of reading from stdout each node listens on a port for tcp.
+        // Via tcp we receive both ClientMessages and RaftMessages.
+        // In handle_connection an incoming TcpStream is sniffed and dispatched to handle either of the type.
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         for stream in listener.incoming() {
             let stream = stream.expect("should have a stream");

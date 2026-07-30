@@ -421,7 +421,7 @@ where
                     state
                         .lock()
                         .expect("no poison")
-                        .replicate_log() // returns RaftMessage::AppendEntries
+                        .replicate_log() // returns Vec<(NodeID, RaftMessage::AppendEntries)>
                         .into_iter()
                         .try_for_each(|msg| raft_tx.send(msg))
                         .expect("raft receiver should never hang up");

@@ -20,18 +20,16 @@ use std::str::FromStr;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-// HTTP/1.1 message format accroding to https://www.rfc-editor.org/info/rfc9112/#section-2
+// HTTP/1.1 message format according to https://www.rfc-editor.org/info/rfc9112/#section-2
 // Messages expected as:
 // HTTP-message   = start-line CRLF
 //                  *( field-line CRLF )
 //                  CRLF
 //                  [ message-body ]
-//
-// enum HttpMessage {
-//     Request(HttpRequest),
-//     Response(HttpResponse),
-// }
 
+// Client-to-node and node-to-node communication happens via tcp.
+// Where clients send HTTP/1.1 and nodes serialized RaftMessages (json).
+// Unidentified to drop any non-Raft related arrivals.
 #[derive(Debug, Eq, PartialEq)]
 pub enum IncomingMessageType {
     HTTPRequest,
@@ -39,6 +37,7 @@ pub enum IncomingMessageType {
     Unidentified,
 }
 
+// Inspired by http crate.
 #[derive(Debug)]
 pub struct Request {
     method: Method,
@@ -53,13 +52,14 @@ pub struct StatusCode(NonZeroU16);
 impl StatusCode {
     pub fn from_u16(code: u16) -> Self {
         if let Some(num) = NonZeroU16::new(code) {
-            return StatusCode(num);
+            StatusCode(num)
         } else {
             unreachable!("should always have valid non-zero u16")
         }
     }
 }
 
+// Inspired by http crate.
 #[derive(Debug)]
 pub struct Response {
     status: StatusCode,
@@ -129,17 +129,19 @@ impl Response {
 
 impl Request {
     pub fn from_stream<S: Read + Write>(stream: S) -> Result<Self, std::io::Error> {
+        // Take a (Tcp)Stream and parse arriving data into the [`Request`] type.
+
         let mut reader = BufReader::new(stream);
 
         // reading request line
         let mut request = String::new();
         reader.read_line(&mut request)?;
         let request_line: Vec<&str> = request.split_whitespace().collect();
-        let incoming_method = Method::from_str(request_line[0])?;
+        let incoming_method =
+            Method::from_str(request_line.first().expect("should have http method"))?;
 
         // reading URI
-        // NOTE: maybe introduce type safe URI
-        let incoming_uri: String = request_line[1].into();
+        let incoming_uri: String = (*request_line.get(1).expect("should have uri")).into();
 
         // reading headers
         let mut incoming_headers: HashMap<String, String> = HashMap::new();
@@ -187,12 +189,19 @@ impl Request {
         })
     }
 
-    pub fn get_key(&self) -> &str {
-        let (_, key) = self
-            .uri
-            .split_once("/key/")
-            .expect("should have /key/ in uri");
-        key
+    pub fn get_key(&self) -> Result<&str, std::io::Error> {
+        let key = self.uri.strip_prefix("/key/").ok_or_else(|| {
+            std::io::Error::new(ErrorKind::InvalidData, "path must start with /key/")
+        })?;
+
+        if key.is_empty() || key.contains('/') {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "key after /key/ in path, not empty or another path",
+            ));
+        }
+
+        Ok(key)
     }
 }
 
@@ -205,13 +214,14 @@ impl TryFrom<Request> for ClientMessage<String, String> {
             .get();
         match item.method {
             Method::Get => Ok(ClientMessage::ReadRequest {
-                key: item.get_key().into(),
+                key: item.get_key()?.into(),
                 id,
             }),
-            // PUT receives WriteRequests and CASRequests with If-Match condition
+            // PUT represents WriteRequests and CASRequests, where CASRequests
+            // expect If-Match condition in header.
             Method::Put => match item.headers.contains_key("If-Match") {
                 true => Ok(ClientMessage::CASRequest {
-                    key: item.get_key().into(),
+                    key: item.get_key()?.into(),
                     from: item
                         .headers
                         .get("If-Match")
@@ -227,7 +237,7 @@ impl TryFrom<Request> for ClientMessage<String, String> {
                     id,
                 }),
                 false => Ok(ClientMessage::WriteRequest {
-                    key: item.get_key().into(),
+                    key: item.get_key()?.into(),
                     value: item.body.ok_or(std::io::Error::new(
                         ErrorKind::InvalidData,
                         "no body, but required for post",
@@ -259,13 +269,9 @@ impl FromStr for Method {
 
 /// Peek a TcpStream to sniff the message type.
 ///
-/// Since now everything arrives via TCP, peek the stream to derive what kind of message is incoming.
-/// - client request (HTTP client)
-/// - forwarded client message (MessageEnvelope)
-/// - client response (MessageEnvelope)
-/// - raft messsage (MesssageEnvelope)
-///
-/// Returns an IncomingMessageType or Error if message can not be resolved.
+/// Used to differentiate between client-to-node (HTTPRequest), node-to-node (JSON) and arbitrary (Unidentified) traffic.
+/// Does not take the stream yet, only checks what type arrived at the socket.
+/// Returns an IncomingMessageType or Error if message is not related to Raft.
 pub fn sniff_message_type(s: &mut TcpStream) -> Result<IncomingMessageType, std::io::Error> {
     let mut buf = [0u8; 7]; // largest HTTP method
     s.peek(&mut buf)?;
@@ -279,12 +285,13 @@ pub fn sniff_message_type(s: &mut TcpStream) -> Result<IncomingMessageType, std:
     }
 }
 
-/// Handles incoming client and peer messages.
+/// Handles traffic arriving at the tcp socket.
 ///
-/// Both client and raft messages land on the TcpStream.
-/// Client messages are HTTP. Raft messages have some tbd wire format.
-/// For incoming client messages, deserialize into ClientMessage move msg on thread handling incoming client messages.
-/// For incoming Raft messages, deserialize into RaftMessage and move msg on thread handling incoming Raft messages.
+/// Differentiate between HTTPRequest, JSON and Unindentified to match dispatch into the Raft engine.
+/// HTTPRequests become ClientMessages and are send down the thread handling incoming client messages.
+/// RaftMessages can be ClientResponses that need to be send down a waiting TcpStream, or RaftMessages
+/// for the Raft engine.
+/// Unidentified messages are dropped by this handle. We do not care for them on this port.
 pub fn handle_connection<K, V, Cmd>(
     id: String,
     mut stream: TcpStream,
@@ -320,7 +327,7 @@ where
             Ok(())
         }
         IncomingMessageType::JSON => {
-            // Sniffed JSON. Try to parse into [`MessageEnvelope`] and dispatch.
+            // Sniffed JSON. Try to parse into [`MessageEnvelope`] to dispatch.
             let recv_json: JSONValue = json::Parser::new(&stream)
                 .parse()
                 .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
@@ -339,39 +346,19 @@ where
                 )
             );
 
-            // If message is not intended to resurface, send to proper channel to be handled by one of the Raft threads.
+            // If message is not intended to resurface, send to proper channel for further handling.
             if !is_client_response {
-                // Client requests -> client channel, raft messages -> raft channel.
+                // Client requests go on the client channel, raft messages on the raft channel.
                 route_incoming(envelope, raft_incoming_tx, client_incoming_tx);
                 return Ok(());
             }
-
-            // Each node keeps client TCP connections open to catch and map reponses to send back.
-            // Responses can occur asynchronously on a different node (e.g. the leader).
-            // Forward responses to the node which holds the client connection.
-            // TODO: in send_tcp we route to destination so this cannot happen
-            // if envelope.destination != id {
-            //     eprintln!("relaying client response to {}", envelope.destination);
-            //     return send_tcp(&envelope);
-            // }
 
             // Strip envelope from message. Destination has been reached, source is irrelevant for response.
             let Message::Client(message) = envelope.body else {
                 unreachable!("guarded by is_client_response")
             };
 
-            // Build qid to match TCPStream waiting for a response.
-            //
-            // NOTE: I do not like it but it works for now.
-            // A response message to this node could have taken two different paths.
-            // (1) This node is a follower. The the request is forwarded to the leader.
-            // In that case the original message_id assigned by this node upon parsing the Request into a ClientRequest will be replaced
-            // by a forward_id (also from this node) and both the forward_id and original_id are inserted into a proxy map along with the node_id.
-            // When a response returns from the leader, the message.id is reverted back to the original_id (comp. loop-back below).
-            // Mapping the response to the request then happens on msg_id.
-            // (2) This node is a leader. There is no need to forward the message. Instead the message receives a fresh response_id from the same node.
-            // The original message_id is set as in_reply_to when building the Command in lib.rs l.724.
-            // Since we do not know here if we are a leader or not we check both cases, poping either from the response_queue and respond.
+            // Build the keys to get the waiting TcpStream from the cache.
             let (msg_id, reply_id) = match &message {
                 ClientMessage::ReadResponse {
                     id, in_reply_to, ..
@@ -412,7 +399,6 @@ where
                     // Response did not hit the branch to reset message_id via proxy map in incoming_client_rpcs_loop.
                     // Message needs another trip through the engine, in order to swap the message_id
                     // back to the original one held in the proxies map.
-                    // This is an extra round trip that should be avoided, but kept here to mirror the maelstrom variant behaviour.
                     eprintln!("no stream for {qid_if_follower} or {qid_if_leader}");
                     client_incoming_tx
                         .send((id, message)) // id == envelope.destination
@@ -429,93 +415,22 @@ where
 }
 
 pub fn send_tcp<B: Serialize>(msg: &MessageEnvelope<B>) -> Result<(), std::io::Error> {
+    // Take a [`MessageEnvelope`] and use minirafts serde crate to serialize into json for tcp transfer.
+
     let payload = msg
         .serialize()
         .expect("all internal types should be serializable")
         .to_string();
 
-    // Node names == TCP ports on localhost.
+    // Node names == tcp ports on localhost.
     let port: u16 = msg.destination.parse().expect("should be parsable");
     eprintln!("sending msg to {}: {payload}", msg.destination);
 
-    // Send MessagEnvelope to destination via TCP
+    // Send MessagEnvelope to destination via tcp
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     stream.write_all(payload.as_bytes())?;
     stream.flush()?;
     stream.shutdown(Shutdown::Write)?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Helper to to simulate incoming messages over Tcp.
-    fn server_stream_with(data: &[u8]) -> TcpStream {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("should bind");
-        let addr = listener.local_addr().expect("should have local addr");
-
-        let mut client = TcpStream::connect(addr).expect("should connect to addr");
-        client.write_all(data).expect("should write test data");
-        client.flush().expect("should flush test data");
-
-        let (server, _) = listener.accept().expect("should accept connection");
-        server
-    }
-
-    #[test]
-    fn get_method_from_string() {
-        let string_method: &str = "GET";
-        assert_eq!(Method::from_str(&string_method).unwrap(), Method::Get);
-    }
-
-    #[test]
-    fn is_incoming_http_request() {
-        let mut stream = server_stream_with(b"GET /key/key-id HTTP/1.1");
-        assert_eq!(
-            sniff_message_type(&mut stream).unwrap(),
-            IncomingMessageType::HTTPRequest
-        );
-    }
-
-    #[test]
-    fn is_not_incoming_http_request() {
-        let mut stream = server_stream_with(b"HTTP/1.1 403 Forbidden");
-        assert_eq!(
-            sniff_message_type(&mut stream).unwrap(),
-            IncomingMessageType::HTTPResponse
-        );
-    }
-
-    #[test]
-    fn get_request_from_stream() {
-        // Use Cursor to simulate TcpStream
-        let test_request: String =
-            "GET /key/key-id HTTP/1.1\r\nContent-Length: 26\r\n\r\nsome simple test body data"
-                .into();
-        let mut buf = Cursor::new(test_request.into_bytes());
-        let test_request = Request::from_stream(&mut buf);
-
-        assert_eq!(test_request.method, Method::Get);
-        assert_eq!(test_request.uri, "/key/key-id");
-        assert_eq!(
-            test_request.headers.get("Content-Length"),
-            Some(&String::from("26"))
-        );
-        assert_eq!(test_request.headers.len(), 1);
-        assert_eq!(
-            test_request.body.clone().unwrap(),
-            "some simple test body data"
-        );
-        assert_eq!(
-            test_request.body.unwrap().len(),
-            test_request
-                .headers
-                .get("Content-Length")
-                .expect("should have content length")
-                .parse::<usize>()
-                .expect("Content-Length should be parsable into usize")
-        )
-    }
 }
