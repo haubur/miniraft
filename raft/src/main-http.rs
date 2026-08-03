@@ -1,5 +1,10 @@
+/// A binary to run the Raft engine while communication happens via tcp/http instead of stdout (maelstrom).
+///
+/// The core is the same as in main.rs.
+/// This variant strips the crash bombs processes used in main.rs to simulate crashes and reboots for maelstrom.
+/// Here, one process spawns N children that run as Raft nodes. The main process just waits for it's child processes.
 use raft::Engine;
-use raft::http::{handle_connection, send_tcp};
+use raft::http::{ConnectionLimiter, handle_connection, send_tcp};
 use raft::maelstrom::NodeMessageIDGenerator;
 use raft::maelstrom::rpc::MessageEnvelope;
 use raft::persistence::{FileMoF, Persistent};
@@ -151,13 +156,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Via tcp we receive both ClientMessages and RaftMessages.
         // In handle_connection an incoming TcpStream is sniffed and dispatched to handle either of the type.
         let listener = TcpListener::bind(("127.0.0.1", port))?;
+        let mut pool = ConnectionLimiter::new(16);
         for stream in listener.incoming() {
             let stream = stream.expect("should have a stream");
             let this_node = this_node.clone();
             let mut correlation_map = Arc::clone(&correlation_map);
             let client_incoming_tx = client_incoming_tx.clone();
             let raft_incoming_tx = raft_incoming_tx.clone();
-            thread::spawn(move || {
+            pool.spawn(move || {
                 handle_connection(
                     this_node,
                     stream,

@@ -17,6 +17,8 @@ use std::num::NonZeroU16;
 use std::str::FromStr;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::thread::JoinHandle;
 
 // HTTP/1.1 message format according to https://www.rfc-editor.org/info/rfc9112/#section-2
 // Messages expected as:
@@ -28,6 +30,9 @@ use std::sync::{Arc, Mutex};
 // Client-to-node and node-to-node communication happens via tcp.
 // Where clients send HTTP/1.1 and nodes serialized RaftMessages (json).
 // Unidentified to drop any non-Raft related arrivals.
+
+const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum IncomingMessageType {
     HTTPRequest,
@@ -126,9 +131,8 @@ impl Response {
 }
 
 impl Request {
+    /// Take a (Tcp)Stream and parse arriving data into the [`Request`] type.
     pub fn from_stream<S: Read + Write>(stream: S) -> Result<Self, std::io::Error> {
-        // Take a (Tcp)Stream and parse arriving data into the [`Request`] type.
-
         let mut reader = BufReader::new(stream);
 
         // reading request line
@@ -272,6 +276,8 @@ impl FromStr for Method {
 /// Returns an IncomingMessageType or Error if message is not related to Raft.
 pub fn sniff_message_type(s: &mut TcpStream) -> Result<IncomingMessageType, std::io::Error> {
     let mut buf = [0u8; 7]; // largest HTTP method
+    // Do not wait forever to read data and avoid hanging the thread.
+    s.set_read_timeout(Some(IO_TIMEOUT))?;
     s.peek(&mut buf)?;
 
     if buf.starts_with(b"GET") || buf.starts_with(b"POST") || buf.starts_with(b"PUT") {
@@ -412,9 +418,8 @@ where
     }
 }
 
+/// Take a [`MessageEnvelope`] and use minirafts serde crate to serialize into json for tcp transfer.
 pub fn send_tcp<B: Serialize>(msg: &MessageEnvelope<B>) -> Result<(), std::io::Error> {
-    // Take a [`MessageEnvelope`] and use minirafts serde crate to serialize into json for tcp transfer.
-
     let payload = msg
         .serialize()
         .expect("all internal types should be serializable")
@@ -431,6 +436,49 @@ pub fn send_tcp<B: Serialize>(msg: &MessageEnvelope<B>) -> Result<(), std::io::E
     stream.shutdown(Shutdown::Write)?;
 
     Ok(())
+}
+
+/// A ConnectionLimiter that drops and respawns a limited number of threads.
+/// This is not a ThreadPool and hence has some performance overhead, but
+/// prevents from spawning unlimited threads on incoming connections.
+#[derive(Debug)]
+pub struct ConnectionLimiter<T> {
+    handles: Vec<JoinHandle<T>>,
+    size: usize,
+}
+
+impl<T> ConnectionLimiter<T> {
+    pub fn new(n: u8) -> Self {
+        Self {
+            handles: Vec::with_capacity(n as usize),
+            size: n as usize,
+        }
+    }
+    pub fn spawn<F>(&mut self, f: F)
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        // Try to spawn a new thread, spinning while the ThreadPool is full.
+        loop {
+            // Clean up Vec of handles, freeing slots of finished threads.
+            self.drop_handle_if_free();
+
+            // Check if pool has an open slot and, if so, run the closure on a new thread.
+            if self.handles.len() < self.size {
+                self.handles.push(thread::spawn(f));
+                return;
+            }
+
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    // Check if any of the JoinHandles have finished.
+    // If yes, drop finished threads' JoinHandles, keeping only running ones.
+    fn drop_handle_if_free(&mut self) {
+        self.handles.retain(|handle| !handle.is_finished());
+    }
 }
 
 #[cfg(test)]
